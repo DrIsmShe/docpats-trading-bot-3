@@ -1,0 +1,17 @@
+{
+  "name": "btc-bot-v2",
+  "version": "1.0.0",
+  "description": "Modular trading platform",
+  "main": "app/server.js",
+  "type": "module",
+  "scripts": {
+    "test:phase1": "node app/test/phase1.test.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.4.1",
+    "mongoose": "^8.23.0"
+  }
+}

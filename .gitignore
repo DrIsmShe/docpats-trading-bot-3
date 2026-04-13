@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Environment variables (СЕКРЕТЫ!)
+.env
+.env.local
+*.env
+
+# Logs
+*.log
+logs/
+
+# Mongo dumps
+*.dump
+*.bson
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
