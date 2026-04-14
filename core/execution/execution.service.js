@@ -15,8 +15,8 @@ import { BinanceFuturesClient } from "../providers/binanceFuturesClient.js";
  *   4. Отправляем MARKET ордер
  *   5. ЖДЁМ исполнения через waitForOrderFill (polling)
  *   6. Создаём запись в Mongo с реальной ценой
- *   7. Выставляем STOP_MARKET (SL) и TAKE_PROFIT_MARKET (TP)
- *   8. Если SL не выставился — emergency close
+ *   7. SL/TP управляется программно через PositionMonitor
+ *      (Binance отклоняет STOP_MARKET через /fapi/v1/order — ошибка -4120)
  *
  * Защиты:
  *   - Если polling упал — проверяем getPositions() и emergency close
@@ -210,10 +210,7 @@ export class ExecutionService {
           );
         }
 
-        return {
-          ok: false,
-          reason: `Order fill failed: ${err.message}`,
-        };
+        return { ok: false, reason: `Order fill failed: ${err.message}` };
       }
 
       const executedQty = parseFloat(filledOrder.executedQty);
@@ -237,11 +234,7 @@ export class ExecutionService {
         } catch (e) {
           console.error(`❌ Safety check failed: ${e.message}`);
         }
-
-        return {
-          ok: false,
-          reason: `Invalid fill data`,
-        };
+        return { ok: false, reason: `Invalid fill data` };
       }
 
       console.log(
@@ -271,56 +264,11 @@ export class ExecutionService {
         mlConfidence: signal.mlConfidence ?? 0,
       });
 
-      // 9. SL + TP
-      // ✅ ИСПРАВЛЕНО: используем quantity + reduceOnly вместо closePosition
-      // closePosition: true вызывал ошибку -4120 (Algo Order API)
-      const closeSide = side === "BUY" ? "SELL" : "BUY";
-      let slOrderId = null;
-      let tpOrderId = null;
-
-      try {
-        const slOrder = await this.binanceClient.placeStopMarket({
-          symbol,
-          side: closeSide,
-          stopPrice: roundedSL,
-          quantity: executedQty,
-          clientOrderId: `${clientOrderPrefix}SL_${Date.now()}`,
-        });
-        slOrderId = String(slOrder.orderId);
-        console.log(`🛡️  SL выставлен @ ${roundedSL}`);
-      } catch (err) {
-        console.error(`❌ CRITICAL: SL failed: ${err.message}`);
-        await this._emergencyClose(symbol, closeSide, executedQty);
-        await this.positionStore.markError(
-          position.id,
-          `SL failed: ${err.message}`,
-        );
-        return {
-          ok: false,
-          reason: `SL failed, position closed: ${err.message}`,
-        };
-      }
-
-      try {
-        const tpOrder = await this.binanceClient.placeTakeProfitMarket({
-          symbol,
-          side: closeSide,
-          stopPrice: roundedTP,
-          quantity: executedQty,
-          clientOrderId: `${clientOrderPrefix}TP_${Date.now()}`,
-        });
-        tpOrderId = String(tpOrder.orderId);
-        console.log(`🎯 TP выставлен @ ${roundedTP}`);
-      } catch (err) {
-        console.warn(
-          `⚠️  TP not set: ${err.message} (position protected by SL)`,
-        );
-      }
-
-      await this.positionStore.updateExchangeIds(position.id, {
-        slOrderId,
-        tpOrderId,
-      });
+      // 9. SL/TP управляется программно через PositionMonitor
+      // Binance отклоняет STOP_MARKET через /fapi/v1/order с ошибкой -4120
+      console.log(
+        `🛡️  SL: ${roundedSL} | TP: ${roundedTP} → управляется PositionMonitor`,
+      );
 
       console.log("─".repeat(60));
       console.log(`✅ LIVE POSITION OPENED [${position.id}]`);
@@ -336,8 +284,8 @@ export class ExecutionService {
         mode: "live",
         position,
         order: filledOrder,
-        slOrderId,
-        tpOrderId,
+        slOrderId: null,
+        tpOrderId: null,
       };
     } catch (err) {
       console.error(`\n❌ _executeLive failed: ${err.message}`);
@@ -360,10 +308,7 @@ export class ExecutionService {
         console.error(`❌ Failed to check stray position: ${checkErr.message}`);
       }
 
-      return {
-        ok: false,
-        reason: `Exchange error: ${err.message}`,
-      };
+      return { ok: false, reason: `Exchange error: ${err.message}` };
     }
   }
 
@@ -454,7 +399,6 @@ export class ExecutionService {
       );
 
       const exitPrice = parseFloat(filled.avgPrice);
-
       const closed = await this.positionStore.close(positionId, {
         exitPrice,
         exitReason,
