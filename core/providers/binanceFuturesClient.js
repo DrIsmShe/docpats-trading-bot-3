@@ -285,61 +285,6 @@ export class BinanceFuturesClient {
     return await this._signedRequest("POST", "/fapi/v1/order", params);
   }
 
-  async placeStopMarket({
-    symbol,
-    side,
-    stopPrice,
-    quantity,
-    clientOrderId,
-    closePosition = false,
-  }) {
-    const params = {
-      symbol,
-      side,
-      type: "STOP_MARKET",
-      stopPrice,
-      timeInForce: "GTE_GTC",
-      workingType: "MARK_PRICE",
-    };
-
-    if (closePosition) {
-      params.closePosition = "true";
-    } else {
-      params.quantity = quantity;
-    }
-
-    if (clientOrderId) params.newClientOrderId = clientOrderId;
-
-    return await this._signedRequest("POST", "/fapi/v1/order", params);
-  }
-
-  async placeTakeProfitMarket({
-    symbol,
-    side,
-    stopPrice,
-    quantity,
-    clientOrderId,
-    closePosition = false,
-  }) {
-    const params = {
-      symbol,
-      side,
-      type: "TAKE_PROFIT_MARKET",
-      stopPrice,
-      timeInForce: "GTE_GTC",
-      workingType: "MARK_PRICE",
-    };
-
-    if (closePosition) {
-      params.closePosition = "true";
-    } else {
-      params.quantity = quantity;
-    }
-
-    if (clientOrderId) params.newClientOrderId = clientOrderId;
-
-    return await this._signedRequest("POST", "/fapi/v1/order", params);
-  }
 
   async closePosition(symbol, side) {
     const positions = await this.getPositions();
