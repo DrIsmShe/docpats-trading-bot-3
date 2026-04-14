@@ -177,7 +177,12 @@ async function bootstrap() {
     positionStore: mlOnlyStore,
     binanceClient,
   });
-
+  const positionMonitor = new PositionMonitor({
+    binanceClient,
+    breakoutStore,
+    mlOnlyStore,
+    pollIntervalMs: 5000,
+  });
   // ── 8. Strategies ───────────────────────────────────────────────
   const breakoutStrategy = new BreakoutStrategy();
   const mlOnlyStrategy = new MLOnlyStrategy({
@@ -410,7 +415,9 @@ async function bootstrap() {
 
   // Первый запуск сразу
   await runCycle();
-
+  if (MODE === "live" || MODE === "testnet") {
+    positionMonitor.start();
+  }
   // Дальше — по интервалу
   const interval = setInterval(runCycle, CYCLE_INTERVAL_MS);
 
@@ -463,7 +470,7 @@ async function bootstrap() {
       `   ML-Only:      ${mlStats.totalTrades} trades, WR ${mlStats.winRate.toFixed(0)}%, PnL $${mlStats.totalPnL.toFixed(2)}`,
     );
     console.log("═".repeat(70));
-
+    positionMonitor.stop();
     await disconnectMongo();
     process.exit(0);
   };
