@@ -1,15 +1,5 @@
 import crypto from "crypto";
 
-/**
- * BinanceFuturesClient — HTTP клиент к Binance USD-M Futures API.
- *
- * Подписывает запросы HMAC-SHA256 как требует Binance.
- * Документация: https://binance-docs.github.io/apidocs/futures/en/
- *
- * РЕЖИМЫ:
- *   - testnet: https://testnet.binancefuture.com
- *   - live:    https://fapi.binance.com
- */
 export class BinanceFuturesClient {
   constructor({ apiKey, apiSecret, testnet = false } = {}) {
     if (!apiKey || !apiSecret) {
@@ -40,19 +30,16 @@ export class BinanceFuturesClient {
   async _publicRequest(method, path, params = {}) {
     const query = this._toQuery(params);
     const url = `${this.baseUrl}${path}${query ? "?" + query : ""}`;
-
     const res = await fetch(url, {
       method,
       headers: { "Content-Type": "application/json" },
     });
-
     if (!res.ok) {
       const text = await res.text();
       throw new Error(
         `Binance ${method} ${path} failed: ${res.status} ${text}`,
       );
     }
-
     return await res.json();
   }
 
@@ -63,9 +50,7 @@ export class BinanceFuturesClient {
     const query = this._toQuery(allParams);
     const signature = this._sign(query);
     const finalQuery = `${query}&signature=${signature}`;
-
     const url = `${this.baseUrl}${path}?${finalQuery}`;
-
     const res = await fetch(url, {
       method,
       headers: {
@@ -73,25 +58,19 @@ export class BinanceFuturesClient {
         "Content-Type": "application/json",
       },
     });
-
     if (!res.ok) {
       const text = await res.text();
       throw new Error(
         `Binance ${method} ${path} failed: ${res.status} ${text}`,
       );
     }
-
     return await res.json();
   }
-
-  // ─── ПУБЛИЧНЫЕ МЕТОДЫ ─────────────────────────────────────────
 
   async getCandles(symbol, interval, limit = 500, endTime = null) {
     const params = { symbol, interval, limit };
     if (endTime) params.endTime = endTime;
-
     const raw = await this._publicRequest("GET", "/fapi/v1/klines", params);
-
     return raw.map((k) => ({
       symbol,
       interval,
@@ -117,7 +96,6 @@ export class BinanceFuturesClient {
     const data = await this._publicRequest("GET", "/fapi/v1/exchangeInfo");
     const info = data.symbols.find((s) => s.symbol === symbol);
     if (!info) throw new Error(`Symbol ${symbol} not found in exchangeInfo`);
-
     const lotSizeFilter = info.filters.find((f) => f.filterType === "LOT_SIZE");
     const priceFilter = info.filters.find(
       (f) => f.filterType === "PRICE_FILTER",
@@ -125,7 +103,6 @@ export class BinanceFuturesClient {
     const minNotionalFilter = info.filters.find(
       (f) => f.filterType === "MIN_NOTIONAL",
     );
-
     return {
       symbol: info.symbol,
       pricePrecision: info.pricePrecision,
@@ -138,14 +115,10 @@ export class BinanceFuturesClient {
     };
   }
 
-  // ─── ПРИВАТНЫЕ МЕТОДЫ ──────────────────────────────────────────
-
   async getBalance() {
     const data = await this._signedRequest("GET", "/fapi/v2/balance");
     const usdt = data.find((b) => b.asset === "USDT");
-    if (!usdt) {
-      return { totalWalletBalance: 0, availableBalance: 0 };
-    }
+    if (!usdt) return { totalWalletBalance: 0, availableBalance: 0 };
     return {
       totalWalletBalance: parseFloat(usdt.balance),
       availableBalance: parseFloat(usdt.availableBalance),
@@ -172,10 +145,6 @@ export class BinanceFuturesClient {
     return await this._signedRequest("GET", "/fapi/v1/openOrders", params);
   }
 
-  /**
-   * Получить статус конкретного ордера.
-   * Используется для проверки — исполнился ли MARKET ордер.
-   */
   async getOrder(symbol, orderId) {
     return await this._signedRequest("GET", "/fapi/v1/order", {
       symbol,
@@ -183,15 +152,6 @@ export class BinanceFuturesClient {
     });
   }
 
-  /**
-   * Дождаться исполнения ордера через polling.
-   * Возвращает заполненный ордер или бросает ошибку если не успел.
-   *
-   * @param {string} symbol
-   * @param {string|number} orderId
-   * @param {number} [maxWaitMs=8000] - максимум ждать
-   * @param {number} [pollIntervalMs=300] - интервал polling
-   */
   async waitForOrderFill(
     symbol,
     orderId,
@@ -200,53 +160,38 @@ export class BinanceFuturesClient {
   ) {
     const startTime = Date.now();
     let lastOrder = null;
-
     while (Date.now() - startTime < maxWaitMs) {
       try {
         const order = await this.getOrder(symbol, orderId);
         lastOrder = order;
-
-        if (order.status === "FILLED") {
-          return order;
-        }
+        if (order.status === "FILLED") return order;
         if (order.status === "PARTIALLY_FILLED") {
           await new Promise((r) => setTimeout(r, pollIntervalMs));
           continue;
         }
-        if (
-          order.status === "EXPIRED" ||
-          order.status === "CANCELED" ||
-          order.status === "REJECTED"
-        ) {
+        if (["EXPIRED", "CANCELED", "REJECTED"].includes(order.status)) {
           throw new Error(
             `Order ${orderId} ${order.status}: ${order.rejectReason ?? ""}`,
           );
         }
-        // NEW — продолжаем ждать
         await new Promise((r) => setTimeout(r, pollIntervalMs));
       } catch (err) {
         if (
           err.message.includes("Order does not exist") ||
           err.message.includes("Unknown order")
         ) {
-          // Ордер ещё не появился в API — ждём
           await new Promise((r) => setTimeout(r, pollIntervalMs));
           continue;
         }
         throw err;
       }
     }
-
-    // Timeout — пробуем отменить висящий ордер
     try {
       await this._signedRequest("DELETE", "/fapi/v1/order", {
         symbol,
         orderId,
       });
-    } catch (err) {
-      // Игнорируем — возможно уже заполнился
-    }
-
+    } catch (err) {}
     throw new Error(
       `Order ${orderId} not filled within ${maxWaitMs}ms. Last status: ${lastOrder?.status ?? "unknown"}`,
     );
@@ -266,40 +211,59 @@ export class BinanceFuturesClient {
         marginType,
       });
     } catch (err) {
-      if (err.message.includes("No need to change margin type")) {
+      if (err.message.includes("No need to change margin type"))
         return { msg: "already_set" };
-      }
       throw err;
     }
   }
 
   async placeMarketOrder({ symbol, side, quantity, clientOrderId }) {
-    const params = {
-      symbol,
-      side,
-      type: "MARKET",
-      quantity,
-    };
+    const params = { symbol, side, type: "MARKET", quantity };
     if (clientOrderId) params.newClientOrderId = clientOrderId;
-
     return await this._signedRequest("POST", "/fapi/v1/order", params);
   }
 
+  async placeStopMarket({ symbol, side, stopPrice, quantity, clientOrderId }) {
+    const params = {
+      symbol,
+      side,
+      type: "STOP_MARKET",
+      stopPrice,
+      quantity,
+      reduceOnly: "true",
+    };
+    if (clientOrderId) params.newClientOrderId = clientOrderId;
+    return await this._signedRequest("POST", "/fapi/v1/order", params);
+  }
 
-  async closePosition(symbol, side) {
+  async placeTakeProfitMarket({
+    symbol,
+    side,
+    stopPrice,
+    quantity,
+    clientOrderId,
+  }) {
+    const params = {
+      symbol,
+      side,
+      type: "TAKE_PROFIT_MARKET",
+      stopPrice,
+      quantity,
+      reduceOnly: "true",
+    };
+    if (clientOrderId) params.newClientOrderId = clientOrderId;
+    return await this._signedRequest("POST", "/fapi/v1/order", params);
+  }
+
+  async closePosition(symbol) {
     const positions = await this.getPositions();
     const pos = positions.find((p) => p.symbol === symbol);
-    if (!pos) {
-      throw new Error(`No open position for ${symbol}`);
-    }
-
+    if (!pos) throw new Error(`No open position for ${symbol}`);
     const closeSide = pos.side === "LONG" ? "SELL" : "BUY";
-    const quantity = Math.abs(pos.positionAmt);
-
     return await this.placeMarketOrder({
       symbol,
       side: closeSide,
-      quantity,
+      quantity: Math.abs(pos.positionAmt),
     });
   }
 
@@ -310,7 +274,6 @@ export class BinanceFuturesClient {
   }
 
   static roundToStepSize(quantity, stepSize) {
-    const precision = Math.round(-Math.log10(stepSize));
     return Math.floor(quantity / stepSize) * stepSize;
   }
 

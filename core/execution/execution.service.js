@@ -176,7 +176,7 @@ export class ExecutionService {
         `📤 [${clientOrderPrefix}] Ордер отправлен #${orderId}, ждём fill...`,
       );
 
-      // 7. ДОЖДАТЬСЯ FILL через polling (ключевое исправление)
+      // 7. ДОЖДАТЬСЯ FILL через polling
       let filledOrder;
       try {
         filledOrder = await this.binanceClient.waitForOrderFill(
@@ -188,7 +188,6 @@ export class ExecutionService {
       } catch (err) {
         console.error(`❌ Order fill wait failed: ${err.message}`);
 
-        // Проверяем — может позиция всё-таки открылась?
         await new Promise((r) => setTimeout(r, 500));
         try {
           const positions = await this.binanceClient.getPositions();
@@ -224,7 +223,6 @@ export class ExecutionService {
         console.error(
           `❌ Filled order has invalid data: ${JSON.stringify(filledOrder)}`,
         );
-        // Safety check
         try {
           const positions = await this.binanceClient.getPositions();
           const openPos = positions.find((p) => p.symbol === symbol);
@@ -274,6 +272,8 @@ export class ExecutionService {
       });
 
       // 9. SL + TP
+      // ✅ ИСПРАВЛЕНО: используем quantity + reduceOnly вместо closePosition
+      // closePosition: true вызывал ошибку -4120 (Algo Order API)
       const closeSide = side === "BUY" ? "SELL" : "BUY";
       let slOrderId = null;
       let tpOrderId = null;
@@ -283,14 +283,13 @@ export class ExecutionService {
           symbol,
           side: closeSide,
           stopPrice: roundedSL,
-          closePosition: true,
+          quantity: executedQty,
           clientOrderId: `${clientOrderPrefix}SL_${Date.now()}`,
         });
         slOrderId = String(slOrder.orderId);
         console.log(`🛡️  SL выставлен @ ${roundedSL}`);
       } catch (err) {
         console.error(`❌ CRITICAL: SL failed: ${err.message}`);
-        // SL не выставился — срочно закрываем позицию
         await this._emergencyClose(symbol, closeSide, executedQty);
         await this.positionStore.markError(
           position.id,
@@ -307,7 +306,7 @@ export class ExecutionService {
           symbol,
           side: closeSide,
           stopPrice: roundedTP,
-          closePosition: true,
+          quantity: executedQty,
           clientOrderId: `${clientOrderPrefix}TP_${Date.now()}`,
         });
         tpOrderId = String(tpOrder.orderId);
@@ -344,7 +343,6 @@ export class ExecutionService {
       console.error(`\n❌ _executeLive failed: ${err.message}`);
       console.error(err.stack);
 
-      // Главная защита — проверяем не осталась ли "забытая" позиция
       try {
         await new Promise((r) => setTimeout(r, 500));
         const positions = await this.binanceClient.getPositions();
@@ -448,7 +446,6 @@ export class ExecutionService {
         clientOrderId: `CLOSE_${Date.now()}`,
       });
 
-      // Ждём fill
       const filled = await this.binanceClient.waitForOrderFill(
         position.symbol,
         closeOrder.orderId,
