@@ -1,21 +1,32 @@
 import { BaseStrategy } from "../BaseStrategy.js";
 
 /**
- * ML-Only Strategy — торгует ТОЛЬКО на основе предсказаний ML модели.
+ * ML-Only Strategy — торгует ТОЛЬКО на основе предсказаний ML модели,
+ * с мягкими контекстными фильтрами.
  *
  * Параметры:
- *   minConfidence    — минимальная уверенность ML для входа (0.45)
- *   atrMultiplierSL  — SL = entry ± ATR × этот множитель (1.5)
- *   atrMultiplierTP  — TP = entry ± ATR × этот множитель (3.0, R/R 1:2)
- *   maxHoldCandles   — max время удержания (24 свечи 1h)
+ *   minConfidence       — базовый минимум ML confidence (0.55)
+ *   atrMultiplierSL     — SL = entry ± ATR × этот множитель (1.5)
+ *   atrMultiplierTP     — TP = entry ± ATR × этот множитель (3.0, R/R 1:2)
+ *   maxHoldCandles      — max время удержания (24 свечи 1h)
+ *   fundingThresholdPct — "сильный" funding в процентах (0.05 = ±0.05%)
+ *   contraFundingBoost  — надбавка к confidence если сигнал ПРОТИВ funding (0.10 = +10%)
+ *   riskyHourBoost      — надбавка в "опасные" часы (0.10 = +10%)
+ *
+ * Фильтры работают как МЯГКИЕ: они повышают требуемый порог confidence,
+ * но не блокируют сигнал полностью. Это позволяет сильным сигналам
+ * проходить даже при неблагоприятном funding/времени суток.
  */
 export class MLOnlyStrategy extends BaseStrategy {
   constructor({
     mlClient,
-    minConfidence = 0.45,
+    minConfidence = 0.55,
     atrMultiplierSL = 1.5,
     atrMultiplierTP = 3.0,
     maxHoldCandles = 24,
+    fundingThresholdPct = 0.05, // ±0.05% = "сильный" funding
+    contraFundingBoost = 0.1, // +10% к порогу если сигнал contra
+    riskyHourBoost = 0.1, // +10% к порогу в опасные часы
   } = {}) {
     super({
       id: "mlOnly",
@@ -26,6 +37,9 @@ export class MLOnlyStrategy extends BaseStrategy {
         atrMultiplierTP,
         maxHoldCandles,
         minCandles: 250,
+        fundingThresholdPct,
+        contraFundingBoost,
+        riskyHourBoost,
       },
     });
 
@@ -37,11 +51,53 @@ export class MLOnlyStrategy extends BaseStrategy {
     this.atrMultiplierSL = atrMultiplierSL;
     this.atrMultiplierTP = atrMultiplierTP;
     this.maxHoldCandles = maxHoldCandles;
+    this.fundingThresholdPct = fundingThresholdPct;
+    this.contraFundingBoost = contraFundingBoost;
+    this.riskyHourBoost = riskyHourBoost;
   }
 
   shouldRun(context) {
     const candles = context.candles?.["1h"] ?? [];
     return candles.length >= this.config.minCandles;
+  }
+
+  /**
+   * Рассчитать эффективный порог confidence на основе рыночного контекста.
+   * Возвращает { threshold, reasons[] } — список применённых надбавок для лога.
+   */
+  _computeEffectiveThreshold(signalDirection, marketContext) {
+    let threshold = this.minConfidence;
+    const reasons = [];
+
+    const funding = marketContext?.funding;
+    const time = marketContext?.time;
+
+    // ── Funding filter ──────────────────────────────────────────
+    // Если funding сильно ПРОТИВ нашего сигнала — повышаем порог.
+    // Контр-funding для BUY = сильно положительный (лонгов много, платят)
+    // Контр-funding для SELL = сильно отрицательный (шортов много, платят)
+    if (funding && typeof funding.ratePct === "number") {
+      const thr = this.fundingThresholdPct;
+      if (signalDirection === "BUY" && funding.ratePct > thr) {
+        threshold += this.contraFundingBoost;
+        reasons.push(
+          `contra_funding (${funding.ratePct.toFixed(3)}% > +${thr}%)`,
+        );
+      } else if (signalDirection === "SELL" && funding.ratePct < -thr) {
+        threshold += this.contraFundingBoost;
+        reasons.push(
+          `contra_funding (${funding.ratePct.toFixed(3)}% < -${thr}%)`,
+        );
+      }
+    }
+
+    // ── Risky hour filter ───────────────────────────────────────
+    if (time?.isRiskyHour) {
+      threshold += this.riskyHourBoost;
+      reasons.push(`risky_hour (${time.reason})`);
+    }
+
+    return { threshold, reasons };
   }
 
   async generateSignal(context) {
@@ -50,6 +106,7 @@ export class MLOnlyStrategy extends BaseStrategy {
     const candles4h = context.candles?.["4h"] ?? [];
     const candles1d = context.candles?.["1d"] ?? [];
     const indicators1h = context.indicators?.["1h"] ?? {};
+    const marketContext = context.marketContext ?? {};
 
     if (candles1h.length < 250) {
       return {
@@ -112,27 +169,30 @@ export class MLOnlyStrategy extends BaseStrategy {
       };
     }
 
-    if (confidence < this.minConfidence) {
+    // Рассчитать эффективный порог с учётом funding/time
+    const { threshold, reasons } = this._computeEffectiveThreshold(
+      signal,
+      marketContext,
+    );
+    const boostLabel =
+      reasons.length > 0 ? ` [+boost: ${reasons.join(", ")}]` : "";
+
+    if (confidence < threshold) {
       return {
         type: "HOLD",
         strategyId: this.id,
         strategyName: this.name,
         symbol,
-        reason: `low_confidence ${(confidence * 100).toFixed(0)}% < ${(this.minConfidence * 100).toFixed(0)}%`,
+        reason: `low_confidence ${(confidence * 100).toFixed(0)}% < ${(threshold * 100).toFixed(0)}%${boostLabel}`,
       };
     }
 
-    // [FIX #1] Абсолютные смещения SL/TP от entry в USDT.
-    // ExecutionService использует их, чтобы пересчитать SL/TP
-    // от РЕАЛЬНОЙ цены исполнения (avgPrice), а не от last.close
-    // на момент генерации сигнала.
-    //
-    // Причина: между сигналом и fill проходит 300-1500ms. За это время
-    // цена может уйти на 10-50 USDT (особенно в волатильные периоды).
-    // Если BUY и цена упала — сохранённый SL оказывается слишком близко
-    // к фактическому entry (или даже выше), и срабатывает мгновенно.
+    // SL/TP offsets — фикс #1 (пересчёт от avgPrice в ExecutionService)
     const slOffset = atr * this.atrMultiplierSL;
     const tpOffset = atr * this.atrMultiplierTP;
+
+    // Логируем "просочившийся через усиленный порог" сигнал явно
+    const reasonSuffix = boostLabel ? ` (passed${boostLabel})` : "";
 
     if (signal === "BUY") {
       return {
@@ -141,16 +201,14 @@ export class MLOnlyStrategy extends BaseStrategy {
         strategyName: this.name,
         symbol,
         entry: last.close,
-        stopLoss: last.close - slOffset, // fallback если слой Execution не пересчитает
+        stopLoss: last.close - slOffset,
         takeProfit: last.close + tpOffset,
         slOffset,
         tpOffset,
         confidence,
-        // [FIX #3] Явно пробрасываем mlSignal/mlConfidence в сигнал,
-        // иначе ExecutionService пишет fallback 0/"HOLD" в Mongo.
         mlSignal: signal,
         mlConfidence: confidence,
-        reason: `ML BUY ${(confidence * 100).toFixed(0)}% ${probsTxt}`,
+        reason: `ML BUY ${(confidence * 100).toFixed(0)}% ${probsTxt}${reasonSuffix}`,
       };
     }
 
@@ -168,7 +226,7 @@ export class MLOnlyStrategy extends BaseStrategy {
         confidence,
         mlSignal: signal,
         mlConfidence: confidence,
-        reason: `ML SELL ${(confidence * 100).toFixed(0)}% ${probsTxt}`,
+        reason: `ML SELL ${(confidence * 100).toFixed(0)}% ${probsTxt}${reasonSuffix}`,
       };
     }
 

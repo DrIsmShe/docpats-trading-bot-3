@@ -64,6 +64,23 @@ export class ContextBuilder {
       htfTrend: market.htfTrend ?? "UNKNOWN",
       volumeRatio: market.volumeRatio ?? 0,
 
+      // Мета-рыночные данные (funding, open interest, time-of-day)
+      // Структура: { funding: {rate, ratePct, nextFundingTime, markPrice}|null,
+      //              openInterest: {currentOI, previousOI, deltaPct, trend}|null,
+      //              time: {utcHour, utcDayOfWeek, isWeekend, isWeekendNight, isRiskyHour, reason} }
+      marketContext: market.marketContext ?? {
+        funding: null,
+        openInterest: null,
+        time: {
+          utcHour: new Date().getUTCHours(),
+          utcDayOfWeek: new Date().getUTCDay(),
+          isWeekend: false,
+          isWeekendNight: false,
+          isRiskyHour: false,
+          reason: null,
+        },
+      },
+
       // Счёт
       balances: market.balances ?? { spot: 0, futures: 0 },
       positions: market.positions ?? { open: [], hasOpenPosition: false },

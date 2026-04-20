@@ -12,6 +12,7 @@
  *   - объёмное соотношение
  *   - балансы
  *   - открытые позиции
+ *   - funding rate / open interest / time context (опционально)
  *
  * Получает все провайдеры через DI (конструктор).
  * Это значит — для тестов можно подменить реальные провайдеры на mock,
@@ -26,6 +27,7 @@ export class MarketLoader {
     accountProvider,
     positionProvider,
     regimeProvider,
+    marketContextProvider = null, // опциональный — если не передан, market-context будет пустым
     config = {},
   }) {
     if (!candleProvider)
@@ -44,6 +46,7 @@ export class MarketLoader {
     this.accountProvider = accountProvider;
     this.positionProvider = positionProvider;
     this.regimeProvider = regimeProvider;
+    this.marketContextProvider = marketContextProvider;
 
     // Конфиг — сколько свечей фетчить для каждого таймфрейма
     this.config = {
@@ -114,7 +117,30 @@ export class MarketLoader {
       this.positionProvider.getOpenPositions(symbol),
     ]);
 
-    // ── 5. Финальная структура market data ──────────────────────
+    // ── 5. Market context (funding, OI, time) — опциональный ────
+    // Если провайдер не передан — возвращаем пустую структуру,
+    // стратегии увидят funding === null и будут работать без фильтра.
+    let marketContext = {
+      funding: null,
+      openInterest: null,
+      time: {
+        utcHour: new Date().getUTCHours(),
+        utcDayOfWeek: new Date().getUTCDay(),
+        isWeekend: false,
+        isWeekendNight: false,
+        isRiskyHour: false,
+        reason: null,
+      },
+    };
+    if (this.marketContextProvider) {
+      try {
+        marketContext = await this.marketContextProvider.loadFull(symbol);
+      } catch (err) {
+        console.warn(`⚠️  marketContextProvider.loadFull: ${err.message}`);
+      }
+    }
+
+    // ── 6. Финальная структура market data ──────────────────────
     return {
       candles: {
         "15m": candles15m,
@@ -132,6 +158,7 @@ export class MarketLoader {
         open: openPositions,
         hasOpenPosition: openPositions.length > 0,
       },
+      marketContext,
     };
   }
 }

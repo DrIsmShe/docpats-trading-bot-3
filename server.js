@@ -29,6 +29,7 @@ import { IndicatorProvider } from "./core/providers/indicatorProvider.js";
 import { AccountProvider } from "./core/providers/accountProvider.js";
 import { PositionProvider } from "./core/providers/positionProvider.js";
 import { RegimeProvider } from "./core/providers/regimeProvider.js";
+import { MarketContextProvider } from "./core/providers/marketContextProvider.js";
 
 // Core modules
 import { MarketLoader } from "./core/market/marketLoader.js";
@@ -56,10 +57,7 @@ const MODE = process.env.TRADING_MODE || "paper";
 const CYCLE_INTERVAL_MS = parseInt(process.env.CYCLE_INTERVAL_MS || "60000");
 const LEVERAGE = parseInt(process.env.LEVERAGE || "10");
 
-// [FIX #2] Cooldown после закрытия позиции (защита от whipsaw-серий).
-// По умолчанию 15 мин. Можно переопределить через .env:
-//   COOLDOWN_AFTER_CLOSE_MS=600000   → 10 мин
-//   COOLDOWN_AFTER_CLOSE_MS=0        → отключить cooldown полностью
+// Cooldown после закрытия позиции (защита от whipsaw-серий).
 const COOLDOWN_AFTER_CLOSE_MS = parseInt(
   process.env.COOLDOWN_AFTER_CLOSE_MS || "900000",
 );
@@ -78,17 +76,50 @@ const MLONLY_DAILY_LOSS_LIMIT = parseFloat(
   process.env.MLONLY_DAILY_LOSS_LIMIT || "20",
 );
 
+// ── [Phase 1 filters] ─────────────────────────────────────────────
+// Минимальный confidence для ML-Only стратегии (0.55 по умолчанию).
+// Рекомендуемые значения: 0.50 (мягко), 0.55 (умеренно), 0.60 (строго).
+const ML_MIN_CONFIDENCE = parseFloat(process.env.ML_MIN_CONFIDENCE || "0.55");
+
+// Что считать "сильным" funding rate в ПРОЦЕНТАХ:
+// 0.03 = строго, 0.05 = умеренно (default), 0.08 = мягко.
+const FUNDING_THRESHOLD_PCT = parseFloat(
+  process.env.FUNDING_THRESHOLD_PCT || "0.05",
+);
+
+// Надбавка к порогу confidence для ML-Only, если сигнал ПРОТИВ funding (0.10 = +10%).
+const CONTRA_FUNDING_BOOST = parseFloat(
+  process.env.CONTRA_FUNDING_BOOST || "0.10",
+);
+
+// Надбавка к порогу в "опасные" часы (выходные 20:00-00:00 UTC).
+const RISKY_HOUR_BOOST = parseFloat(process.env.RISKY_HOUR_BOOST || "0.10");
+
+// Для Breakout — умножитель порога volRatio (фильтр объёма).
+// 0.30 = +30% к minVolumeRatio при contra-funding или risky hour.
+const BREAKOUT_CONTRA_FUNDING_VOL_BOOST = parseFloat(
+  process.env.BREAKOUT_CONTRA_FUNDING_VOL_BOOST || "0.30",
+);
+const BREAKOUT_RISKY_HOUR_VOL_BOOST = parseFloat(
+  process.env.BREAKOUT_RISKY_HOUR_VOL_BOOST || "0.30",
+);
+
 console.log("═".repeat(70));
 console.log("🚀 btc-bot-v3 — Modular Trading Platform");
 console.log("═".repeat(70));
-console.log(`   Symbol:       ${SYMBOL}`);
-console.log(`   Mode:         ${MODE.toUpperCase()}`);
-console.log(`   Interval:     ${CYCLE_INTERVAL_MS / 1000}s`);
-console.log(`   Leverage:     x${LEVERAGE}`);
-console.log(`   ML-Only size: ${ML_ONLY_SIZE_BTC} BTC`);
-console.log(`   ML URL:       ${ML_SERVICE_URL}`);
+console.log(`   Symbol:         ${SYMBOL}`);
+console.log(`   Mode:           ${MODE.toUpperCase()}`);
+console.log(`   Interval:       ${CYCLE_INTERVAL_MS / 1000}s`);
+console.log(`   Leverage:       x${LEVERAGE}`);
+console.log(`   ML-Only size:   ${ML_ONLY_SIZE_BTC} BTC`);
+console.log(`   ML URL:         ${ML_SERVICE_URL}`);
 console.log(
-  `   Cooldown:     ${COOLDOWN_AFTER_CLOSE_MS === 0 ? "disabled" : Math.round(COOLDOWN_AFTER_CLOSE_MS / 60000) + "min after close"}`,
+  `   Cooldown:       ${COOLDOWN_AFTER_CLOSE_MS === 0 ? "disabled" : Math.round(COOLDOWN_AFTER_CLOSE_MS / 60000) + "min after close"}`,
+);
+console.log(`   ML minConf:     ${ML_MIN_CONFIDENCE}`);
+console.log(`   Funding thr:    ±${FUNDING_THRESHOLD_PCT}%`);
+console.log(
+  `   Boosts:         contra-funding +${(CONTRA_FUNDING_BOOST * 100).toFixed(0)}% | risky-hour +${(RISKY_HOUR_BOOST * 100).toFixed(0)}%`,
 );
 console.log("═".repeat(70));
 
@@ -144,8 +175,6 @@ async function bootstrap() {
   }
 
   // ── 4. Market Data Poller ───────────────────────────────────────
-  // В live режиме подкачиваем свечи с Binance
-  // В paper режиме используем существующие данные в Mongo
   let marketDataPoller = null;
   if (MODE === "live" || MODE === "testnet") {
     marketDataPoller = new MarketDataPoller({
@@ -159,6 +188,9 @@ async function bootstrap() {
   const candleProvider = new CandleProvider();
   const indicatorProvider = new IndicatorProvider();
   const regimeProvider = new RegimeProvider();
+  const marketContextProvider = new MarketContextProvider({
+    cacheTtlMs: 60_000, // funding/OI обновляются не чаще раза в минуту
+  });
 
   const accountProvider =
     MODE === "live" || MODE === "testnet"
@@ -194,14 +226,22 @@ async function bootstrap() {
     mlOnlyStore,
     pollIntervalMs: 5000,
   });
+
   // ── 8. Strategies ───────────────────────────────────────────────
-  const breakoutStrategy = new BreakoutStrategy();
+  const breakoutStrategy = new BreakoutStrategy({
+    fundingThresholdPct: FUNDING_THRESHOLD_PCT,
+    contraFundingVolBoost: BREAKOUT_CONTRA_FUNDING_VOL_BOOST,
+    riskyHourVolBoost: BREAKOUT_RISKY_HOUR_VOL_BOOST,
+  });
   const mlOnlyStrategy = new MLOnlyStrategy({
     mlClient,
-    minConfidence: 0.45,
+    minConfidence: ML_MIN_CONFIDENCE,
     atrMultiplierSL: 1.5,
     atrMultiplierTP: 3.0,
     maxHoldCandles: 24,
+    fundingThresholdPct: FUNDING_THRESHOLD_PCT,
+    contraFundingBoost: CONTRA_FUNDING_BOOST,
+    riskyHourBoost: RISKY_HOUR_BOOST,
   });
 
   console.log(`\n📋 Registered strategies:`);
@@ -219,7 +259,6 @@ async function bootstrap() {
   });
 
   // ── 10. Context / Strategy Manager ──────────────────────────────
-  // positionProvider использует store из Breakout (для контекста)
   const positionProvider = new PositionProvider({
     mode: MODE === "paper" ? "paper" : "mongo",
     store: breakoutStore,
@@ -231,6 +270,7 @@ async function bootstrap() {
     accountProvider,
     positionProvider,
     regimeProvider,
+    marketContextProvider, // ← новое, Phase 1
   });
 
   const contextBuilder = new ContextBuilder({
@@ -262,10 +302,6 @@ async function bootstrap() {
     dailyStats.mlOnlyPnL <= -MLONLY_DAILY_LOSS_LIMIT;
 
   // ── 12. Strategy runner ─────────────────────────────────────────
-  /**
-   * Прогнать одну стратегию в текущем цикле.
-   * Каждая стратегия = независимая торговая единица со своим store и execution.
-   */
   async function runStrategy({
     strategy,
     store,
@@ -276,7 +312,6 @@ async function bootstrap() {
   }) {
     const strategyId = strategy.id;
 
-    // 1. Проверка daily loss limit
     if (strategyId === "breakout" && isBreakoutStopped()) {
       return { skipped: "daily_loss_limit" };
     }
@@ -284,16 +319,12 @@ async function bootstrap() {
       return { skipped: "daily_loss_limit" };
     }
 
-    // 2. Проверка — есть ли уже открытая позиция этой стратегии?
     const openPositions = await store.getOpenPositions();
     if (openPositions.length > 0) {
       return { skipped: "already_has_open_position" };
     }
 
-    // [FIX #2] 2.5. Cooldown после закрытия последней позиции.
-    // Защита от whipsaw-серий (было 19.04 17:52–17:59: 5 сделок за 7 минут).
-    // Блокируем открытие новой позиции в течение COOLDOWN_AFTER_CLOSE_MS
-    // после любого закрытия (SL, TP, TIMEOUT, MANUAL).
+    // Cooldown после закрытия последней позиции
     if (COOLDOWN_AFTER_CLOSE_MS > 0) {
       const lastClosed = await store.getLastClosedPosition();
       if (lastClosed?.closedAt) {
@@ -314,16 +345,13 @@ async function bootstrap() {
       }
     }
 
-    // 3. Получить сигнал
     const signal = await strategy.generateSignal(ctx);
     if (signal.type === "HOLD") {
       return { action: "HOLD", reason: signal.reason };
     }
 
-    // 4. Risk management — для Breakout через RiskManager, для ML-Only фиксированный размер
     let riskedSignal;
     if (fixedSize !== null) {
-      // ML-Only: фиксированный размер, простая калькуляция
       const positionSize = fixedSize;
       const notional = positionSize * signal.entry;
       const requiredMargin = notional / LEVERAGE;
@@ -337,7 +365,6 @@ async function bootstrap() {
         leverage: LEVERAGE,
       };
     } else {
-      // Breakout: нормальный RiskManager
       const balances = await accountProvider.getBalances();
       const plan = breakoutRiskManager.buildPlan({
         signal,
@@ -355,7 +382,6 @@ async function bootstrap() {
       };
     }
 
-    // 5. Execute
     const result = await execution.execute(riskedSignal, { clientOrderPrefix });
 
     if (!result.ok) {
@@ -385,17 +411,27 @@ async function bootstrap() {
     try {
       resetDailyStatsIfNewDay();
 
-      // Подкачать свежие свечи (только live/testnet)
       if (marketDataPoller) {
         await marketDataPoller.sync();
       }
 
-      // Построить контекст (общий для обеих стратегий)
       const ctx = await contextBuilder.build({ symbol: SYMBOL });
 
       if (!ctx) {
         console.warn("⚠️  Failed to build context, skipping cycle");
         return;
+      }
+
+      // Компактный лог контекстных условий (funding/time)
+      const fr = ctx.marketContext?.funding;
+      const tc = ctx.marketContext?.time;
+      if (fr || tc) {
+        const parts = [];
+        if (fr) parts.push(`funding ${fr.ratePct.toFixed(3)}%`);
+        if (tc?.isRiskyHour) parts.push(`⚠️ risky_hour (${tc.reason})`);
+        if (parts.length > 0) {
+          console.log(`🌐 Context: ${parts.join(" | ")}`);
+        }
       }
 
       // Прогнать Breakout
@@ -406,7 +442,7 @@ async function bootstrap() {
         execution: breakoutExecution,
         ctx,
         clientOrderPrefix: "BRK",
-        fixedSize: null, // используем RiskManager
+        fixedSize: null,
       });
       console.log(`   ${JSON.stringify(breakoutResult)}`);
 
@@ -422,7 +458,6 @@ async function bootstrap() {
       });
       console.log(`   ${JSON.stringify(mlResult)}`);
 
-      // Статистика
       const breakoutStats = await breakoutStore.getStats();
       const mlStats = await mlOnlyStore.getStats();
 
@@ -448,20 +483,16 @@ async function bootstrap() {
     }
   };
 
-  // Первый запуск сразу
   await runCycle();
   if (MODE === "live" || MODE === "testnet") {
     positionMonitor.start();
   }
-  // Дальше — по интервалу
   const interval = setInterval(runCycle, CYCLE_INTERVAL_MS);
 
-  // ── 14. Graceful shutdown ───────────────────────────────────────
   const shutdown = async (signal) => {
     console.log(`\n\n🛑 ${signal} received, shutting down...`);
     clearInterval(interval);
 
-    // Дождаться завершения текущего цикла
     let waited = 0;
     while (isRunning && waited < 10000) {
       await new Promise((r) => setTimeout(r, 100));
@@ -469,8 +500,6 @@ async function bootstrap() {
     }
 
     if (MODE === "live" || MODE === "testnet") {
-      // ВАЖНО: открытые позиции НЕ закрываем автоматически
-      // Они останутся на Binance с выставленными SL/TP
       const breakoutOpen = await breakoutStore.getOpenPositions();
       const mlOpen = await mlOnlyStore.getOpenPositions();
 

@@ -17,19 +17,23 @@ import {
  *   - моментум (3 свечи подряд)
  *   - волатильность (ATR > 0.18%)
  *
- * Walk-forward результат на 5 окнах × 17 дней:
- *   - 2/5 прибыльных окон
- *   - Total PnL: +$31.61
- *   - Avg PF: 1.42
- *   - Max DD: 2.4%
+ * СОФТ-ФИЛЬТРЫ (добавлены в фазе 1):
+ *   - Funding rate: если funding сильно ПРОТИВ направления — требуем
+ *     бОльший volRatio (на 30%) для подтверждения
+ *   - Risky hour (выходные вечер): требуем бОльший volRatio (на 30%)
+ *   Не блокируем сделку полностью, а повышаем планку объёма.
  */
 export class BreakoutStrategy extends BaseStrategy {
-  constructor() {
+  constructor(overrides = {}) {
     super({
       id: breakoutConfig.id,
       name: breakoutConfig.name,
-      config: breakoutConfig,
+      config: { ...breakoutConfig, ...overrides },
     });
+
+    this.fundingThresholdPct = overrides.fundingThresholdPct ?? 0.05;
+    this.contraFundingVolBoost = overrides.contraFundingVolBoost ?? 0.3;
+    this.riskyHourVolBoost = overrides.riskyHourVolBoost ?? 0.3;
   }
 
   shouldRun(context) {
@@ -37,9 +41,48 @@ export class BreakoutStrategy extends BaseStrategy {
     return candles.length >= this.config.minCandles;
   }
 
+  /**
+   * Рассчитать эффективный volRatio-порог с учётом contextual фильтров.
+   * Возвращает { threshold, reasons[] }.
+   */
+  _computeEffectiveVolRatio(direction, marketContext) {
+    const base = this.config.minVolumeRatio;
+    let multiplier = 1.0;
+    const reasons = [];
+
+    const funding = marketContext?.funding;
+    const time = marketContext?.time;
+
+    if (funding && typeof funding.ratePct === "number") {
+      const thr = this.fundingThresholdPct;
+      if (direction === "BUY" && funding.ratePct > thr) {
+        multiplier += this.contraFundingVolBoost;
+        reasons.push(
+          `contra_funding (${funding.ratePct.toFixed(3)}% > +${thr}%)`,
+        );
+      } else if (direction === "SELL" && funding.ratePct < -thr) {
+        multiplier += this.contraFundingVolBoost;
+        reasons.push(
+          `contra_funding (${funding.ratePct.toFixed(3)}% < -${thr}%)`,
+        );
+      }
+    }
+
+    if (time?.isRiskyHour) {
+      multiplier += this.riskyHourVolBoost;
+      reasons.push(`risky_hour (${time.reason})`);
+    }
+
+    return {
+      threshold: base * multiplier,
+      reasons,
+    };
+  }
+
   generateSignal(context) {
     const symbol = context.symbol;
     const candles = context.candles?.["1h"] ?? [];
+    const marketContext = context.marketContext ?? {};
 
     if (candles.length < this.config.minCandles) {
       return createHoldSignal({
@@ -131,13 +174,25 @@ export class BreakoutStrategy extends BaseStrategy {
       bullish &&
       lastRSI > 52 &&
       lastRSI < 75 &&
-      volRatio > this.config.minVolumeRatio &&
       upMom
     ) {
+      const { threshold: volThr, reasons } = this._computeEffectiveVolRatio(
+        "BUY",
+        marketContext,
+      );
+      if (volRatio <= volThr) {
+        return createHoldSignal({
+          strategyId: this.id,
+          strategyName: this.name,
+          symbol,
+          reason: `breakout_up_blocked_volRatio ${volRatio.toFixed(2)} ≤ ${volThr.toFixed(2)}${
+            reasons.length ? ` [+boost: ${reasons.join(", ")}]` : ""
+          }`,
+          meta: { volRatio, volThr, atrPercent, high20 },
+        });
+      }
       const slMul = this.config.slMultiplier ?? 1.5;
       const tpMul = this.config.tpMultiplier ?? 3.5;
-      // [FIX #1] Абсолютные смещения — для пересчёта SL/TP в ExecutionService
-      // от РЕАЛЬНОЙ цены исполнения (avgPrice), а не от signal.entry.
       const slOffset = lastATR * slMul;
       const tpOffset = lastATR * tpMul;
       const sig = createTradeSignal({
@@ -149,10 +204,11 @@ export class BreakoutStrategy extends BaseStrategy {
         stopLoss: price - slOffset,
         takeProfit: price + tpOffset,
         confidence: 0.72,
-        reason: `Breakout up vol:${volRatio.toFixed(2)}x rsi:${lastRSI.toFixed(0)}`,
-        meta: { volRatio, atrPercent, high20 },
+        reason: `Breakout up vol:${volRatio.toFixed(2)}x rsi:${lastRSI.toFixed(0)}${
+          reasons.length ? ` (passed boost)` : ""
+        }`,
+        meta: { volRatio, volThr, atrPercent, high20 },
       });
-      // Расширяем результат createTradeSignal полями, которых helper может не знать
       return { ...sig, slOffset, tpOffset };
     }
 
@@ -165,9 +221,23 @@ export class BreakoutStrategy extends BaseStrategy {
       bearish &&
       lastRSI < 48 &&
       lastRSI > 25 &&
-      volRatio > this.config.minVolumeRatio &&
       downMom
     ) {
+      const { threshold: volThr, reasons } = this._computeEffectiveVolRatio(
+        "SELL",
+        marketContext,
+      );
+      if (volRatio <= volThr) {
+        return createHoldSignal({
+          strategyId: this.id,
+          strategyName: this.name,
+          symbol,
+          reason: `breakout_down_blocked_volRatio ${volRatio.toFixed(2)} ≤ ${volThr.toFixed(2)}${
+            reasons.length ? ` [+boost: ${reasons.join(", ")}]` : ""
+          }`,
+          meta: { volRatio, volThr, atrPercent, low20 },
+        });
+      }
       const slMul = this.config.slMultiplier ?? 1.5;
       const tpMul = this.config.tpMultiplier ?? 3.5;
       const slOffset = lastATR * slMul;
@@ -181,8 +251,10 @@ export class BreakoutStrategy extends BaseStrategy {
         stopLoss: price + slOffset,
         takeProfit: price - tpOffset,
         confidence: 0.72,
-        reason: `Breakout down vol:${volRatio.toFixed(2)}x rsi:${lastRSI.toFixed(0)}`,
-        meta: { volRatio, atrPercent, low20 },
+        reason: `Breakout down vol:${volRatio.toFixed(2)}x rsi:${lastRSI.toFixed(0)}${
+          reasons.length ? ` (passed boost)` : ""
+        }`,
+        meta: { volRatio, volThr, atrPercent, low20 },
       });
       return { ...sig, slOffset, tpOffset };
     }

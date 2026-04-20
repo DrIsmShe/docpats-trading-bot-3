@@ -12,6 +12,10 @@
  *   UPTREND   — устойчивый рост (EMA20 > EMA50, цена выше EMA20)
  *   DOWNTREND — устойчивое падение (EMA20 < EMA50, цена ниже EMA20)
  *   SIDEWAYS  — флэт / неопределённость
+ *
+ * ПРИМЕЧАНИЕ: эвристика isRiskyHour / getTimeContext живёт в
+ * MarketContextProvider, поскольку там же funding/OI. RegimeProvider
+ * остаётся чисто про режим рынка на основе свечей.
  */
 import { calcEMA } from "./indicators.calc.js";
 
