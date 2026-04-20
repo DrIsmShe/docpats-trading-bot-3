@@ -20,6 +20,10 @@
  * РЕЖИМЫ (через .env):
  *   TRADING_MODE=paper  → симуляция, позиции в памяти
  *   TRADING_MODE=live   → реальная торговля на Binance
+ *
+ * [GAP #2] При старте в live/testnet режиме выполняется reconcile состояния:
+ *   сверка открытых позиций в БД с реальным состоянием на бирже.
+ *   Это защита от рассинхрона после падений/рестартов.
  */
 
 import "dotenv/config";
@@ -500,6 +504,31 @@ async function bootstrap() {
     }
   };
 
+  // ── 13.5. [GAP #2] Startup reconcile ────────────────────────────
+  //
+  // КРИТИЧНО: сверка БД↔биржа ДО первого runCycle.
+  //
+  // Если бот упал между placeMarketOrder и store.close() на прошлом запуске:
+  //   - На бирже: позиция уже закрыта
+  //   - В БД:    позиция всё ещё OPEN
+  // Без reconcile runCycle увидит "already_has_open_position" и не откроет
+  // новую, а PositionMonitor будет циклически пытаться её закрывать
+  // (reduceOnly reject).
+  //
+  // Обратный кейс (позиция на бирже есть, в БД нет) — Telegram-алерт,
+  // НЕ закрываем автоматически, т.к. не знаем SL/TP/entry.
+  if (MODE === "live" || MODE === "testnet") {
+    try {
+      await positionMonitor.reconcileOnStartup();
+    } catch (err) {
+      console.error(`❌ Startup reconcile failed: ${err.message}`);
+      console.error(
+        `   Продолжаю bootstrap, но состояние БД↔биржа может быть рассинхронизировано.`,
+      );
+    }
+  }
+
+  // ── 13.6. First cycle + start monitor + interval ────────────────
   await runCycle();
   if (MODE === "live" || MODE === "testnet") {
     positionMonitor.start();

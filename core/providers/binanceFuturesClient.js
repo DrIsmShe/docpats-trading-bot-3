@@ -220,16 +220,11 @@ export class BinanceFuturesClient {
   /**
    * Разместить MARKET-ордер.
    *
-   * [FIX #4] Добавлен параметр reduceOnly.
-   * Для close-ордеров (PositionMonitor, emergency close, closeLive)
-   * ВСЕГДА нужно передавать reduceOnly=true — это гарантирует, что ордер
-   * только уменьшит существующую позицию, но не откроет обратную (flip).
-   *
-   * Без reduceOnly: если позиция в момент закрытия уже была (частично)
-   * закрыта по другой причине — обычный market ордер перевернул бы её
-   * в противоположном направлении. Orphan-позиция.
-   *
-   * Для OPEN-ордеров reduceOnly должен быть false (по умолчанию).
+   * Для ОТКРЫТИЯ позиций: reduceOnly=false (по умолчанию).
+   * Для ЗАКРЫТИЯ позиций: ВСЕГДА используйте closeMarketOrder() — он
+   * гарантированно выставит reduceOnly=true. Не вызывайте placeMarketOrder
+   * с reduceOnly=true напрямую в close-сценариях: closeMarketOrder делает
+   * намерение явным и защищает от случайных flip-ордеров в будущем коде.
    */
   async placeMarketOrder({
     symbol,
@@ -242,6 +237,27 @@ export class BinanceFuturesClient {
     if (clientOrderId) params.newClientOrderId = clientOrderId;
     if (reduceOnly) params.reduceOnly = "true";
     return await this._signedRequest("POST", "/fapi/v1/order", params);
+  }
+
+  /**
+   * [GAP #3] Явный метод для закрытия позиций.
+   *
+   * Всегда отправляет ордер с reduceOnly=true, что гарантирует:
+   *   - ордер только уменьшит/закроет существующую позицию
+   *   - никогда не откроет обратную (flip → orphan)
+   *
+   * Весь close-код в боте (PositionMonitor, emergency close, ручное
+   * закрытие по timeout) должен использовать этот метод, а не
+   * placeMarketOrder напрямую.
+   */
+  async closeMarketOrder({ symbol, side, quantity, clientOrderId }) {
+    return await this.placeMarketOrder({
+      symbol,
+      side,
+      quantity,
+      clientOrderId,
+      reduceOnly: true,
+    });
   }
 
   async placeStopMarket({ symbol, side, stopPrice, quantity, clientOrderId }) {
@@ -281,12 +297,10 @@ export class BinanceFuturesClient {
     const pos = positions.find((p) => p.symbol === symbol);
     if (!pos) throw new Error(`No open position for ${symbol}`);
     const closeSide = pos.side === "LONG" ? "SELL" : "BUY";
-    // [FIX #4] reduceOnly=true для явного close
-    return await this.placeMarketOrder({
+    return await this.closeMarketOrder({
       symbol,
       side: closeSide,
       quantity: Math.abs(pos.positionAmt),
-      reduceOnly: true,
     });
   }
 
