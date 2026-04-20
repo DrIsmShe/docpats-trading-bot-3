@@ -15,20 +15,28 @@ import {
  *   - RSI в зоне силы
  *   - объём подтверждает (volRatio > 1.3)
  *   - моментум (3 свечи подряд)
- *   - волатильность (ATR > 0.18%)
+ *   - волатильность (ATR > minVolatilityPct)
  *
- * СОФТ-ФИЛЬТРЫ (добавлены в фазе 1):
- *   - Funding rate: если funding сильно ПРОТИВ направления — требуем
- *     бОльший volRatio (на 30%) для подтверждения
- *   - Risky hour (выходные вечер): требуем бОльший volRatio (на 30%)
- *   Не блокируем сделку полностью, а повышаем планку объёма.
+ * MULTI-SYMBOL: стратегия работает на любом символе (BTCUSDT, ETHUSDT...).
+ *   - Для ETHUSDT рекомендуется minVolatilityPct=0.30 (ETH волатильнее BTC)
+ *   - Для BTCUSDT — 0.18 (дефолт из .config.js)
+ *
+ * СОФТ-ФИЛЬТРЫ (Phase 1):
+ *   - Funding rate: против направления → +30% к volRatio-порогу
+ *   - Risky hour (выходные вечер) → +30% к volRatio-порогу
  */
 export class BreakoutStrategy extends BaseStrategy {
   constructor(overrides = {}) {
+    // Overrides из .env имеют приоритет над .config.js
+    const effectiveConfig = {
+      ...breakoutConfig,
+      ...overrides,
+    };
+
     super({
       id: breakoutConfig.id,
       name: breakoutConfig.name,
-      config: { ...breakoutConfig, ...overrides },
+      config: effectiveConfig,
     });
 
     this.fundingThresholdPct = overrides.fundingThresholdPct ?? 0.05;
@@ -41,10 +49,6 @@ export class BreakoutStrategy extends BaseStrategy {
     return candles.length >= this.config.minCandles;
   }
 
-  /**
-   * Рассчитать эффективный volRatio-порог с учётом contextual фильтров.
-   * Возвращает { threshold, reasons[] }.
-   */
   _computeEffectiveVolRatio(direction, marketContext) {
     const base = this.config.minVolumeRatio;
     let multiplier = 1.0;
@@ -93,7 +97,6 @@ export class BreakoutStrategy extends BaseStrategy {
       });
     }
 
-    // ── Индикаторы ─────────────────────────────────────────────
     const indicators = context.indicators?.["1h"] ?? {};
     const ema20Arr = indicators.ema20 ?? [];
     const ema50Arr = indicators.ema50 ?? [];
@@ -129,30 +132,27 @@ export class BreakoutStrategy extends BaseStrategy {
     const price = last.close;
     const atrPercent = (lastATR / price) * 100;
 
-    // ── Фильтр волатильности ────────────────────────────────────
+    // Фильтр волатильности — порог настраивается (для ETH строже)
     if (atrPercent < this.config.minVolatilityPct) {
       return createHoldSignal({
         strategyId: this.id,
         strategyName: this.name,
         symbol,
-        reason: `Low volatility (ATR ${atrPercent.toFixed(2)}%)`,
+        reason: `Low volatility (ATR ${atrPercent.toFixed(2)}% < ${this.config.minVolatilityPct}%)`,
         meta: { atrPercent },
       });
     }
 
-    // ── High/Low за 20 свечей ───────────────────────────────────
     const closes = candles.map((c) => c.close);
     const lookback = closes.slice(-21, -1);
     const high20 = Math.max(...lookback);
     const low20 = Math.min(...lookback);
 
-    // ── Объём ──────────────────────────────────────────────────
     const volumes = candles.slice(-20).map((c) => c.volume);
     const avgVol =
       volumes.slice(0, -1).reduce((a, b) => a + b, 0) / (volumes.length - 1);
     const volRatio = avgVol > 0 ? last.volume / avgVol : 0;
 
-    // ── Свечной анализ ─────────────────────────────────────────
     const range = last.high - last.low || 1;
     const body = Math.abs(last.close - last.open);
     const bodyRatio = body / range;
@@ -166,7 +166,7 @@ export class BreakoutStrategy extends BaseStrategy {
     const downtrend = lastEMA20 < lastEMA50;
 
     // ═══════════════════════════════════════════════════════════
-    // 🟢 LONG: пробой high20 + все подтверждения
+    // 🟢 LONG
     // ═══════════════════════════════════════════════════════════
     if (
       price > high20 &&
@@ -213,7 +213,7 @@ export class BreakoutStrategy extends BaseStrategy {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // 🔴 SHORT: пробой low20 + все подтверждения
+    // 🔴 SHORT
     // ═══════════════════════════════════════════════════════════
     if (
       price < low20 &&
