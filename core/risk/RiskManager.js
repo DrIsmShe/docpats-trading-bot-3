@@ -31,6 +31,16 @@
  * Без плеча ты блокируешь $140 маржи и при том же SL теряешь те же $1.4.
  *
  * Плечо позволяет экономить капитал, не увеличивая риск на сделку.
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * API:
+ *   - apply(signal, context)              — высокоуровневый интерфейс
+ *                                            для TradingEngine, требует
+ *                                            полный context
+ *   - buildPlan({ signal, balance, leverage }) — низкоуровневый
+ *                                            интерфейс для server.js
+ *                                            runStrategy, context не нужен
+ * ─────────────────────────────────────────────────────────────────────
  */
 export class RiskManager {
   constructor({
@@ -46,7 +56,7 @@ export class RiskManager {
   }
 
   /**
-   * Применить риск-менеджмент к торговому сигналу.
+   * Применить риск-менеджмент к торговому сигналу (high-level, для TradingEngine).
    *
    * @param {Object} signal  - сигнал от стратегии
    * @param {Object} context - полный контекст рынка (нужен для balance, positions, riskProfile)
@@ -92,7 +102,50 @@ export class RiskManager {
     };
     const leverage = riskProfile.leverage ?? 1;
 
-    // ── 5. Расчёт размера позиции ───────────────────────────────
+    return this._compute({ signal, balance, leverage });
+  }
+
+  /**
+   * [FIX #5] Построить plan для сигнала без полного context.
+   *
+   * Используется в server.js runStrategy — там context ещё не строится
+   * для Breakout (RiskManager вызывается по упрощённому пути), поэтому
+   * apply() не подходит. Этот метод берёт balance и leverage напрямую
+   * из параметров.
+   *
+   * До этого фикса server.js вызывал несуществующий метод buildPlan,
+   * что порождало TypeError в каждом цикле, где Breakout давал сигнал.
+   *
+   * @param {Object} params
+   * @param {Object} params.signal   - сигнал стратегии с entry/stopLoss/takeProfit
+   * @param {number} params.balance  - баланс в USDT
+   * @param {number} params.leverage - плечо (по умолчанию 1)
+   * @returns {Object} plan - { allowed, reason, positionSize, positionNotional, requiredMargin, leverage, riskAmount }
+   */
+  buildPlan({ signal, balance, leverage = 1 }) {
+    if (!signal) {
+      return { allowed: false, reason: "No signal" };
+    }
+    if (!signal.entry || !signal.stopLoss) {
+      return {
+        allowed: false,
+        reason: "Signal missing entry/stopLoss",
+      };
+    }
+    if (balance == null || balance < this.minBalance) {
+      return {
+        allowed: false,
+        reason: `Balance too low: $${(balance ?? 0).toFixed(2)} < $${this.minBalance}`,
+      };
+    }
+    return this._compute({ signal, balance, leverage });
+  }
+
+  /**
+   * Внутренний расчёт размера позиции.
+   * Используется и apply(), и buildPlan() — единая формула.
+   */
+  _compute({ signal, balance, leverage }) {
     const entry = signal.entry;
     const stopLoss = signal.stopLoss;
     const stopDistance = Math.abs(entry - stopLoss);
@@ -109,15 +162,11 @@ export class RiskManager {
     // КЛЮЧЕВАЯ ФОРМУЛА: размер позиции рассчитывается так,
     // чтобы при срабатывании SL потерять ровно riskAmount
     const riskAmount = balance * this.riskPerTrade;
-    const positionNotional = riskAmount / stopDistancePct; // в USDT
-    const positionSizeBase = positionNotional / entry; // в BTC
-
-    // Маржа которую заблокирует биржа (зависит от плеча)
+    const positionNotional = riskAmount / stopDistancePct;
+    const positionSize = positionNotional / entry;
     const requiredMargin = positionNotional / leverage;
 
-    // ── 6. Защитные проверки ────────────────────────────────────
-
-    // 6a. Минимальный размер ордера (биржа не примет $1 ордер)
+    // ── Защитные проверки ───────────────────────────────────────
     if (positionNotional < this.minPositionUSDT) {
       return {
         allowed: false,
@@ -126,7 +175,6 @@ export class RiskManager {
       };
     }
 
-    // 6b. Защита от багов: позиция не больше N× баланса даже с плечом
     const maxAllowedNotional = balance * this.maxPositionPctOfBalance;
     if (positionNotional > maxAllowedNotional) {
       return {
@@ -136,7 +184,6 @@ export class RiskManager {
       };
     }
 
-    // 6c. Маржа должна влезть в баланс
     if (requiredMargin > balance) {
       return {
         allowed: false,
@@ -145,21 +192,15 @@ export class RiskManager {
       };
     }
 
-    // ── 7. Сигнал разрешён ──────────────────────────────────────
     return {
       allowed: true,
       reason: null,
-
-      // Оригинальный сигнал
-      ...signal,
-
-      // Risk-расчёт
-      positionSize: positionSizeBase, // в BTC
+      positionSize, // в BTC
       positionNotional, // в USDT (полный размер)
       requiredMargin, // в USDT (что заблокирует биржа)
-      leverage, // плечо
+      leverage,
       riskAmount, // ожидаемый убыток при SL
-      balance, // текущий баланс
+      balance,
     };
   }
 }

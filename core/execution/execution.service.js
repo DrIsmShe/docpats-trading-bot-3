@@ -12,14 +12,15 @@ import { BinanceFuturesClient } from "../providers/binanceFuturesClient.js";
  *   1. Получаем symbol info (tickSize, stepSize)
  *   2. Округляем quantity/цены
  *   3. Устанавливаем leverage и marginType ISOLATED
- *   4. Отправляем MARKET ордер
+ *   4. Отправляем MARKET ордер (reduceOnly=false — open)
  *   5. ЖДЁМ исполнения через waitForOrderFill (polling)
- *   6. Создаём запись в Mongo с реальной ценой
- *   7. SL/TP управляется программно через PositionMonitor
+ *   6. [FIX #1] Пересчитываем SL/TP от РЕАЛЬНОЙ avgPrice через slOffset/tpOffset
+ *   7. Создаём запись в Mongo с реальной ценой
+ *   8. SL/TP управляется программно через PositionMonitor
  *      (Binance отклоняет STOP_MARKET через /fapi/v1/order — ошибка -4120)
  *
  * Защиты:
- *   - Если polling упал — проверяем getPositions() и emergency close
+ *   - Если polling упал — проверяем getPositions() и emergency close (reduceOnly)
  *   - Если главный catch — тоже проверяем getPositions() и emergency close
  */
 export class ExecutionService {
@@ -88,6 +89,8 @@ export class ExecutionService {
       strategyName: signal.strategyName,
       confidence: signal.confidence,
       reason: signal.reason,
+      mlSignal: signal.mlSignal ?? "HOLD",
+      mlConfidence: signal.mlConfidence ?? signal.confidence ?? 0,
     });
 
     console.log("\n" + "─".repeat(60));
@@ -128,12 +131,12 @@ export class ExecutionService {
         };
       }
 
-      // 3. Округлить SL/TP к tickSize
-      const roundedSL = BinanceFuturesClient.roundToTickSize(
+      // 3. Округлить SL/TP к tickSize (из сигнала — будет пересчитано после fill)
+      const signalSL = BinanceFuturesClient.roundToTickSize(
         stopLoss,
         info.tickSize,
       );
-      const roundedTP = BinanceFuturesClient.roundToTickSize(
+      const signalTP = BinanceFuturesClient.roundToTickSize(
         takeProfit,
         info.tickSize,
       );
@@ -161,9 +164,11 @@ export class ExecutionService {
       console.log(
         `   Qty: ${quantity} BTC | Notional: ~$${(quantity * signal.entry).toFixed(2)}`,
       );
-      console.log(`   SL: ${roundedSL} | TP: ${roundedTP} | Lev: x${leverage}`);
+      console.log(
+        `   Signal SL: ${signalSL} | TP: ${signalTP} | Lev: x${leverage}`,
+      );
 
-      // 6. MARKET ордер
+      // 6. MARKET ордер (OPEN — reduceOnly=false по умолчанию)
       const order = await this.binanceClient.placeMarketOrder({
         symbol,
         side,
@@ -241,6 +246,46 @@ export class ExecutionService {
         `✅ [${clientOrderPrefix}] MARKET исполнен: ${executedQty} BTC @ ${avgPrice}`,
       );
 
+      // [FIX #1] Пересчитать SL/TP от РЕАЛЬНОЙ цены исполнения.
+      //
+      // До фикса: SL/TP считались от signal.entry (last.close на момент сигнала).
+      // Если за время отправки ордера цена ушла — сохранённый SL мог оказаться
+      // вплотную к entry (или даже на неправильной стороне), что вызывало
+      // мгновенный SL на первом же тике PositionMonitor.
+      //
+      // После фикса: если стратегия передала slOffset/tpOffset — применяем их
+      // к avgPrice. Получаем стабильное расстояние SL/TP независимо от slippage.
+      let finalSL = signalSL;
+      let finalTP = signalTP;
+      if (
+        typeof signal.slOffset === "number" &&
+        typeof signal.tpOffset === "number" &&
+        signal.slOffset > 0 &&
+        signal.tpOffset > 0
+      ) {
+        const rawSL =
+          side === "BUY"
+            ? avgPrice - signal.slOffset
+            : avgPrice + signal.slOffset;
+        const rawTP =
+          side === "BUY"
+            ? avgPrice + signal.tpOffset
+            : avgPrice - signal.tpOffset;
+        finalSL = BinanceFuturesClient.roundToTickSize(rawSL, info.tickSize);
+        finalTP = BinanceFuturesClient.roundToTickSize(rawTP, info.tickSize);
+
+        if (finalSL !== signalSL || finalTP !== signalTP) {
+          const drift = avgPrice - signal.entry;
+          console.log(
+            `   🔧 SL/TP recalc from fill (drift ${drift >= 0 ? "+" : ""}${drift.toFixed(2)}): SL ${signalSL} → ${finalSL}, TP ${signalTP} → ${finalTP}`,
+          );
+        }
+      } else {
+        console.warn(
+          `   ⚠️  No slOffset/tpOffset in signal — using signal-time SL/TP as-is`,
+        );
+      }
+
       // 8. Запись в Mongo
       const domainSide = side === "BUY" ? "LONG" : "SHORT";
       const notional = executedQty * avgPrice;
@@ -249,8 +294,8 @@ export class ExecutionService {
         symbol,
         side: domainSide,
         entry: avgPrice,
-        stopLoss: roundedSL,
-        takeProfit: roundedTP,
+        stopLoss: finalSL,
+        takeProfit: finalTP,
         positionSize: executedQty,
         notional,
         leverage,
@@ -260,14 +305,15 @@ export class ExecutionService {
         reason: signal.reason,
         clientOrderId,
         orderId: String(orderId),
+        // [FIX #3] fallback на signal.confidence для стратегий,
+        // которые не знают про поле mlConfidence (например Breakout)
         mlSignal: signal.mlSignal ?? "HOLD",
-        mlConfidence: signal.mlConfidence ?? 0,
+        mlConfidence: signal.mlConfidence ?? signal.confidence ?? 0,
       });
 
       // 9. SL/TP управляется программно через PositionMonitor
-      // Binance отклоняет STOP_MARKET через /fapi/v1/order с ошибкой -4120
       console.log(
-        `🛡️  SL: ${roundedSL} | TP: ${roundedTP} → управляется PositionMonitor`,
+        `🛡️  SL: ${finalSL} | TP: ${finalTP} → управляется PositionMonitor`,
       );
 
       console.log("─".repeat(60));
@@ -275,7 +321,7 @@ export class ExecutionService {
       console.log(
         `   ${symbol} ${domainSide} ${executedQty} BTC @ ${avgPrice}`,
       );
-      console.log(`   SL: ${roundedSL} | TP: ${roundedTP}`);
+      console.log(`   SL: ${finalSL} | TP: ${finalTP}`);
       console.log(`   Strategy: ${signal.strategyName}`);
       console.log("─".repeat(60));
 
@@ -314,6 +360,7 @@ export class ExecutionService {
 
   /**
    * Экстренно закрыть позицию без SL/TP.
+   * [FIX #4] reduceOnly=true — гарантия, что не переворачиваем позицию.
    */
   async _emergencyClose(symbol, closeSide, quantity) {
     try {
@@ -323,6 +370,7 @@ export class ExecutionService {
         side: closeSide,
         quantity,
         clientOrderId: `EMERGENCY_${Date.now()}`,
+        reduceOnly: true,
       });
       console.warn(`✅ Emergency close done`);
     } catch (err) {
@@ -366,6 +414,7 @@ export class ExecutionService {
 
   /**
    * Закрыть live-позицию вручную.
+   * [FIX #4] reduceOnly=true — гарантия, что не переворачиваем позицию.
    */
   async closeLive(positionId, { exitReason = "MANUAL" } = {}) {
     if (this.mode !== "live" && this.mode !== "testnet") {
@@ -389,6 +438,7 @@ export class ExecutionService {
         side: closeSide,
         quantity: position.positionSize,
         clientOrderId: `CLOSE_${Date.now()}`,
+        reduceOnly: true,
       });
 
       const filled = await this.binanceClient.waitForOrderFill(

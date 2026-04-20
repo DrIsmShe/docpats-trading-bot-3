@@ -122,6 +122,18 @@ export class MLOnlyStrategy extends BaseStrategy {
       };
     }
 
+    // [FIX #1] Абсолютные смещения SL/TP от entry в USDT.
+    // ExecutionService использует их, чтобы пересчитать SL/TP
+    // от РЕАЛЬНОЙ цены исполнения (avgPrice), а не от last.close
+    // на момент генерации сигнала.
+    //
+    // Причина: между сигналом и fill проходит 300-1500ms. За это время
+    // цена может уйти на 10-50 USDT (особенно в волатильные периоды).
+    // Если BUY и цена упала — сохранённый SL оказывается слишком близко
+    // к фактическому entry (или даже выше), и срабатывает мгновенно.
+    const slOffset = atr * this.atrMultiplierSL;
+    const tpOffset = atr * this.atrMultiplierTP;
+
     if (signal === "BUY") {
       return {
         type: "BUY",
@@ -129,9 +141,15 @@ export class MLOnlyStrategy extends BaseStrategy {
         strategyName: this.name,
         symbol,
         entry: last.close,
-        stopLoss: last.close - atr * this.atrMultiplierSL,
-        takeProfit: last.close + atr * this.atrMultiplierTP,
+        stopLoss: last.close - slOffset, // fallback если слой Execution не пересчитает
+        takeProfit: last.close + tpOffset,
+        slOffset,
+        tpOffset,
         confidence,
+        // [FIX #3] Явно пробрасываем mlSignal/mlConfidence в сигнал,
+        // иначе ExecutionService пишет fallback 0/"HOLD" в Mongo.
+        mlSignal: signal,
+        mlConfidence: confidence,
         reason: `ML BUY ${(confidence * 100).toFixed(0)}% ${probsTxt}`,
       };
     }
@@ -143,9 +161,13 @@ export class MLOnlyStrategy extends BaseStrategy {
         strategyName: this.name,
         symbol,
         entry: last.close,
-        stopLoss: last.close + atr * this.atrMultiplierSL,
-        takeProfit: last.close - atr * this.atrMultiplierTP,
+        stopLoss: last.close + slOffset,
+        takeProfit: last.close - tpOffset,
+        slOffset,
+        tpOffset,
         confidence,
+        mlSignal: signal,
+        mlConfidence: confidence,
         reason: `ML SELL ${(confidence * 100).toFixed(0)}% ${probsTxt}`,
       };
     }

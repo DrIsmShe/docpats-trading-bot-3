@@ -5,7 +5,10 @@
  * поэтому SL/TP реализован программно:
  *   - Каждые N секунд запрашивает текущую цену
  *   - Сравнивает с SL/TP из MongoDB
- *   - При достижении — закрывает MARKET ордером
+ *   - При достижении — закрывает MARKET ордером с reduceOnly=true
+ *   - [FIX #4] После fill верифицирует через getPositions(), что позиция
+ *     действительно закрылась на бирже. Если нет — оставляет запись OPEN,
+ *     алертит в Telegram, повторит на следующем tick.
  *
  * Запускается параллельно с основным циклом бота.
  */
@@ -113,15 +116,19 @@ export class PositionMonitor {
         `   ${symbol} ${side} | Цена: ${price} | SL: ${stopLoss} | TP: ${takeProfit}`,
       );
 
-      // Закрываем MARKET ордером
+      // Закрываем MARKET ордером (с reduceOnly=true)
       const closeSide = side === "LONG" ? "SELL" : "BUY";
 
       try {
+        // [FIX #4] reduceOnly=true гарантирует, что ордер не перевернёт позицию.
+        // Без этого флага, если позиция уже (частично) закрыта по другой причине,
+        // обычный market-ордер открыл бы обратную позицию (orphan).
         const order = await this.binanceClient.placeMarketOrder({
           symbol,
           side: closeSide,
           quantity: positionSize,
           clientOrderId: `${triggered.reason}_${Date.now()}`,
+          reduceOnly: true,
         });
 
         // Ждём fill
@@ -133,6 +140,50 @@ export class PositionMonitor {
         );
 
         const exitPrice = parseFloat(filled.avgPrice) || triggered.exitPrice;
+
+        // [FIX #4] Верификация через биржу: реально ли позиция закрыта?
+        // Проверяем getPositions() и убеждаемся что positionAmt стал 0.
+        // Если нет — оставляем запись OPEN, алерт, повторим на следующем tick.
+        let positionStillOpen = false;
+        try {
+          // Небольшая задержка, чтобы Binance обновил состояние после fill
+          await new Promise((r) => setTimeout(r, 400));
+          const exchangePositions = await this.binanceClient.getPositions();
+          const stillOpen = exchangePositions.find(
+            (p) => p.symbol === symbol && Math.abs(p.positionAmt) > 0,
+          );
+          if (stillOpen) {
+            positionStillOpen = true;
+            console.error(
+              `🚨 [${strategyName}] Позиция НЕ закрыта на бирже после reduce-only fill!`,
+            );
+            console.error(
+              `   symbol=${symbol} positionAmt=${stillOpen.positionAmt} entryPrice=${stillOpen.entryPrice}`,
+            );
+          }
+        } catch (verifyErr) {
+          // Верификация не удалась (сеть/API) — не блокируем close в БД,
+          // но логируем warning. Fill уже подтверждён waitForOrderFill'ом.
+          console.warn(
+            `⚠️  [${strategyName}] getPositions() verify упал: ${verifyErr.message}. Trust the fill.`,
+          );
+        }
+
+        if (positionStillOpen) {
+          // НЕ закрываем в MongoDB — при следующем tick повторим попытку
+          if (this.telegram) {
+            await this.telegram
+              .send(
+                `🚨 *${strategyName}* close failed verification\n` +
+                  `${symbol} ${side}\n` +
+                  `Fill был OK, но getPositions() всё ещё видит позицию.\n` +
+                  `Оставил в БД как OPEN, попробую снова на следующем tick.\n` +
+                  `**Если не закроется — ручное вмешательство.**`,
+              )
+              .catch(() => {});
+          }
+          return;
+        }
 
         // Закрываем позицию в MongoDB
         const closed = await store.close(pos.id, {
@@ -166,6 +217,16 @@ export class PositionMonitor {
         console.error(
           `   ПОЗИЦИЯ ОСТАЁТСЯ ОТКРЫТОЙ — требуется ручное вмешательство!`,
         );
+        if (this.telegram) {
+          await this.telegram
+            .send(
+              `❌ *${strategyName}* close order FAILED\n` +
+                `${symbol} ${side}\n` +
+                `Error: ${closeErr.message}\n` +
+                `Позиция на бирже открыта, SL/TP НЕ обрабатывается. Ручной разбор.`,
+            )
+            .catch(() => {});
+        }
       }
     } catch (err) {
       console.error(`❌ PositionMonitor checkPosition error: ${err.message}`);

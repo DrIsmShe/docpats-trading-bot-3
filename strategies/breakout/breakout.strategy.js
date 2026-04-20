@@ -136,18 +136,24 @@ export class BreakoutStrategy extends BaseStrategy {
     ) {
       const slMul = this.config.slMultiplier ?? 1.5;
       const tpMul = this.config.tpMultiplier ?? 3.5;
-      return createTradeSignal({
+      // [FIX #1] Абсолютные смещения — для пересчёта SL/TP в ExecutionService
+      // от РЕАЛЬНОЙ цены исполнения (avgPrice), а не от signal.entry.
+      const slOffset = lastATR * slMul;
+      const tpOffset = lastATR * tpMul;
+      const sig = createTradeSignal({
         strategyId: this.id,
         strategyName: this.name,
         symbol,
         type: SIGNAL_TYPES.BUY,
         entry: price,
-        stopLoss: price - lastATR * slMul,
-        takeProfit: price + lastATR * tpMul,
+        stopLoss: price - slOffset,
+        takeProfit: price + tpOffset,
         confidence: 0.72,
         reason: `Breakout up vol:${volRatio.toFixed(2)}x rsi:${lastRSI.toFixed(0)}`,
         meta: { volRatio, atrPercent, high20 },
       });
+      // Расширяем результат createTradeSignal полями, которых helper может не знать
+      return { ...sig, slOffset, tpOffset };
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -164,18 +170,21 @@ export class BreakoutStrategy extends BaseStrategy {
     ) {
       const slMul = this.config.slMultiplier ?? 1.5;
       const tpMul = this.config.tpMultiplier ?? 3.5;
-      return createTradeSignal({
+      const slOffset = lastATR * slMul;
+      const tpOffset = lastATR * tpMul;
+      const sig = createTradeSignal({
         strategyId: this.id,
         strategyName: this.name,
         symbol,
         type: SIGNAL_TYPES.SELL,
         entry: price,
-        stopLoss: price + lastATR * slMul,
-        takeProfit: price - lastATR * tpMul,
+        stopLoss: price + slOffset,
+        takeProfit: price - tpOffset,
         confidence: 0.72,
         reason: `Breakout down vol:${volRatio.toFixed(2)}x rsi:${lastRSI.toFixed(0)}`,
         meta: { volRatio, atrPercent, low20 },
       });
+      return { ...sig, slOffset, tpOffset };
     }
 
     return createHoldSignal({

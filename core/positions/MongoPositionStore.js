@@ -26,6 +26,9 @@ import { Position } from "../../app/db/Position.model.js";
  *
  *   // Закрыть позицию:
  *   await store.close(positionId, { exitPrice: 73500, exitReason: "TP" });
+ *
+ *   // Проверить cooldown после закрытия:
+ *   const lastClosed = await store.getLastClosedPosition();
  */
 export class MongoPositionStore {
   /**
@@ -38,26 +41,6 @@ export class MongoPositionStore {
 
   /**
    * Создать новую позицию в БД.
-   *
-   * @param {object} params
-   * @param {string} params.symbol
-   * @param {string} params.side - "LONG" | "SHORT"
-   * @param {number} params.entry - цена входа
-   * @param {number} params.stopLoss
-   * @param {number} params.takeProfit
-   * @param {number} params.positionSize - количество BTC (например 0.002)
-   * @param {number} params.notional - в USDT (positionSize * entry)
-   * @param {number} params.leverage
-   * @param {string} params.strategyId - id стратегии (breakout / mlOnly)
-   * @param {string} params.strategyName
-   * @param {number} [params.confidence]
-   * @param {string} [params.reason]
-   * @param {string} [params.clientOrderId] - наш ID для отслеживания на бирже
-   * @param {string} [params.orderId] - Binance orderId главного ордера
-   * @param {string} [params.slOrderId] - Binance orderId STOP_MARKET
-   * @param {string} [params.tpOrderId] - Binance orderId TAKE_PROFIT_MARKET
-   * @param {string} [params.mlSignal]
-   * @param {number} [params.mlConfidence]
    */
   async open(params) {
     // side: LONG → BUY, SHORT → SELL (для совместимости с серверным ботом)
@@ -89,11 +72,6 @@ export class MongoPositionStore {
 
   /**
    * Закрыть позицию.
-   *
-   * @param {string} positionId - _id из Mongo (или clientOrderId)
-   * @param {object} params
-   * @param {number} params.exitPrice
-   * @param {string} params.exitReason - "TP" | "SL" | "TIME" | "MANUAL" | "ERROR"
    */
   async close(positionId, { exitPrice, exitReason }) {
     const position = await Position.findById(positionId);
@@ -171,6 +149,28 @@ export class MongoPositionStore {
    */
   async getById(positionId) {
     const doc = await Position.findById(positionId);
+    return doc ? this._toDomain(doc) : null;
+  }
+
+  /**
+   * [FIX #2] Получить последнюю ЗАКРЫТУЮ позицию этой стратегии.
+   * Используется в server.js для cooldown-проверки: после закрытия позиции
+   * бот не открывает новую в течение COOLDOWN_AFTER_CLOSE_MS (по умолчанию 15 мин).
+   *
+   * Это защита от whipsaw-серий вроде 19 апреля 17:52–17:59, когда бот за 7 минут
+   * открыл и закрыл 5 позиций, съев $0.37 на комиссиях и slippage.
+   *
+   * Игнорирует ERROR-записи (только реальные закрытия) — их тоже считать было бы
+   * неверно, потому что ERROR-позиции фактически не открывались на бирже.
+   *
+   * @returns {Promise<object|null>} domain-объект позиции или null если нет закрытых
+   */
+  async getLastClosedPosition() {
+    const filter = { status: "CLOSED" };
+    if (this.strategyId) {
+      filter.strategy = this.strategyId;
+    }
+    const doc = await Position.findOne(filter).sort({ closedAt: -1 });
     return doc ? this._toDomain(doc) : null;
   }
 

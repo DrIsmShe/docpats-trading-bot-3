@@ -56,6 +56,14 @@ const MODE = process.env.TRADING_MODE || "paper";
 const CYCLE_INTERVAL_MS = parseInt(process.env.CYCLE_INTERVAL_MS || "60000");
 const LEVERAGE = parseInt(process.env.LEVERAGE || "10");
 
+// [FIX #2] Cooldown после закрытия позиции (защита от whipsaw-серий).
+// По умолчанию 15 мин. Можно переопределить через .env:
+//   COOLDOWN_AFTER_CLOSE_MS=600000   → 10 мин
+//   COOLDOWN_AFTER_CLOSE_MS=0        → отключить cooldown полностью
+const COOLDOWN_AFTER_CLOSE_MS = parseInt(
+  process.env.COOLDOWN_AFTER_CLOSE_MS || "900000",
+);
+
 // Размеры позиций (BTC)
 const ML_ONLY_SIZE_BTC = parseFloat(process.env.ML_ONLY_SIZE_BTC || "0.002");
 
@@ -79,6 +87,9 @@ console.log(`   Interval:     ${CYCLE_INTERVAL_MS / 1000}s`);
 console.log(`   Leverage:     x${LEVERAGE}`);
 console.log(`   ML-Only size: ${ML_ONLY_SIZE_BTC} BTC`);
 console.log(`   ML URL:       ${ML_SERVICE_URL}`);
+console.log(
+  `   Cooldown:     ${COOLDOWN_AFTER_CLOSE_MS === 0 ? "disabled" : Math.round(COOLDOWN_AFTER_CLOSE_MS / 60000) + "min after close"}`,
+);
 console.log("═".repeat(70));
 
 async function bootstrap() {
@@ -277,6 +288,30 @@ async function bootstrap() {
     const openPositions = await store.getOpenPositions();
     if (openPositions.length > 0) {
       return { skipped: "already_has_open_position" };
+    }
+
+    // [FIX #2] 2.5. Cooldown после закрытия последней позиции.
+    // Защита от whipsaw-серий (было 19.04 17:52–17:59: 5 сделок за 7 минут).
+    // Блокируем открытие новой позиции в течение COOLDOWN_AFTER_CLOSE_MS
+    // после любого закрытия (SL, TP, TIMEOUT, MANUAL).
+    if (COOLDOWN_AFTER_CLOSE_MS > 0) {
+      const lastClosed = await store.getLastClosedPosition();
+      if (lastClosed?.closedAt) {
+        const sinceCloseMs =
+          Date.now() - new Date(lastClosed.closedAt).getTime();
+        if (sinceCloseMs < COOLDOWN_AFTER_CLOSE_MS) {
+          const remainingSec = Math.ceil(
+            (COOLDOWN_AFTER_CLOSE_MS - sinceCloseMs) / 1000,
+          );
+          const remainingLabel =
+            remainingSec >= 60
+              ? `${Math.ceil(remainingSec / 60)}min`
+              : `${remainingSec}s`;
+          return {
+            skipped: `cooldown_${remainingLabel}_after_${lastClosed.exitReason ?? "close"}`,
+          };
+        }
+      }
     }
 
     // 3. Получить сигнал

@@ -217,9 +217,30 @@ export class BinanceFuturesClient {
     }
   }
 
-  async placeMarketOrder({ symbol, side, quantity, clientOrderId }) {
+  /**
+   * Разместить MARKET-ордер.
+   *
+   * [FIX #4] Добавлен параметр reduceOnly.
+   * Для close-ордеров (PositionMonitor, emergency close, closeLive)
+   * ВСЕГДА нужно передавать reduceOnly=true — это гарантирует, что ордер
+   * только уменьшит существующую позицию, но не откроет обратную (flip).
+   *
+   * Без reduceOnly: если позиция в момент закрытия уже была (частично)
+   * закрыта по другой причине — обычный market ордер перевернул бы её
+   * в противоположном направлении. Orphan-позиция.
+   *
+   * Для OPEN-ордеров reduceOnly должен быть false (по умолчанию).
+   */
+  async placeMarketOrder({
+    symbol,
+    side,
+    quantity,
+    clientOrderId,
+    reduceOnly = false,
+  }) {
     const params = { symbol, side, type: "MARKET", quantity };
     if (clientOrderId) params.newClientOrderId = clientOrderId;
+    if (reduceOnly) params.reduceOnly = "true";
     return await this._signedRequest("POST", "/fapi/v1/order", params);
   }
 
@@ -260,10 +281,12 @@ export class BinanceFuturesClient {
     const pos = positions.find((p) => p.symbol === symbol);
     if (!pos) throw new Error(`No open position for ${symbol}`);
     const closeSide = pos.side === "LONG" ? "SELL" : "BUY";
+    // [FIX #4] reduceOnly=true для явного close
     return await this.placeMarketOrder({
       symbol,
       side: closeSide,
       quantity: Math.abs(pos.positionAmt),
+      reduceOnly: true,
     });
   }
 
