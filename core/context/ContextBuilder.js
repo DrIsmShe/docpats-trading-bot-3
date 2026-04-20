@@ -2,11 +2,17 @@
  * ContextBuilder — собирает финальный контекст для одного цикла торговли.
  *
  * Это тонкая обёртка над MarketLoader, которая:
- *   - Добавляет к рыночным данным ML предсказание (если ML включён)
+ *   - Добавляет к рыночным данным ML предсказание (если ML включён
+ *     И для данного символа не передан skipML=true)
  *   - Прикрепляет ссылку на список стратегий (нужно RiskManager-у)
  *   - Стандартизирует структуру context
  *
  * Стратегии, RiskManager и ExecutionService работают с этим контекстом.
+ *
+ * [ML SCOPE] ML-модель натренирована на BTC. Для других символов (ETH, etc)
+ * предсказания бессмысленны и приводят к ошибкам, если в БД недостаточно
+ * свечей. В таких случаях передавайте skipML: true — ML-блок будет пустым
+ * (enabled: false), стратегии это корректно игнорируют.
  */
 export class ContextBuilder {
   constructor({ marketLoader, mlClient = null, strategies = [] }) {
@@ -17,7 +23,16 @@ export class ContextBuilder {
     this.strategies = strategies;
   }
 
-  async build({ symbol }) {
+  /**
+   * Собрать контекст для одного символа.
+   *
+   * @param {Object} opts
+   * @param {string} opts.symbol  - например "BTCUSDT" или "ETHUSDT"
+   * @param {boolean} [opts.skipML=false] - пропустить ML-запрос для этого символа.
+   *   Используется для символов, на которых ML-модель не обучена (например ETH),
+   *   чтобы не спамить /predict бесполезными запросами и не засорять error.log.
+   */
+  async build({ symbol, skipML = false }) {
     // ── 1. Загружаем рыночные данные ────────────────────────────
     const market = await this.marketLoader.load(symbol);
 
@@ -29,7 +44,7 @@ export class ContextBuilder {
       raw: null,
     };
 
-    if (this.mlClient) {
+    if (this.mlClient && !skipML) {
       try {
         const mlResult = await this.mlClient.predict({
           symbol,

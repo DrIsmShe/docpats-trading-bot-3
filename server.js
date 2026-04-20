@@ -4,13 +4,18 @@
  * Server entry point.
  *
  * Две стратегии работают параллельно на РАЗНЫХ символах:
- *   1. Breakout 1h — trend following (ETHUSDT по умолчанию)
+ *   1. Breakout 1h — trend following (ETHUSDT по умолчанию, БЕЗ ML)
  *   2. ML-Only    — нейросеть (BTCUSDT — ML обучена на BTC)
  *
  * Такое распределение полностью исключает конфликт стратегий:
  *   - Нет ситуации "одна даёт LONG, вторая SHORT на одном символе"
  *   - Binance держит их как 2 независимые позиции (разные символы)
  *   - ML-модель используется только на BTC (на котором обучена)
+ *
+ * [ML SCOPE] ML-контекст собирается ТОЛЬКО для MLONLY_SYMBOL (BTC).
+ * Для BREAKOUT_SYMBOL (ETH) контекст строится с skipML=true — стратегия
+ * Breakout ML не использует, а модель для ETH не обучена, так что
+ * бесполезные /predict запросы только спамили бы error.log.
  *
  * Каждая стратегия имеет:
  *   - Свой символ (через .env: BREAKOUT_SYMBOL, MLONLY_SYMBOL)
@@ -61,7 +66,7 @@ const CYCLE_INTERVAL_MS = parseInt(process.env.CYCLE_INTERVAL_MS || "60000");
 const LEVERAGE = parseInt(process.env.LEVERAGE || "10");
 
 // [MULTI-SYMBOL] Разные символы для разных стратегий.
-// Breakout на ETH, ML-Only на BTC (модель натренирована на BTC).
+// Breakout на ETH (без ML), ML-Only на BTC (модель натренирована на BTC).
 const BREAKOUT_SYMBOL = process.env.BREAKOUT_SYMBOL || "ETHUSDT";
 const MLONLY_SYMBOL = process.env.MLONLY_SYMBOL || "BTCUSDT";
 
@@ -113,7 +118,7 @@ console.log("═".repeat(70));
 console.log(`   Mode:           ${MODE.toUpperCase()}`);
 console.log(`   Interval:       ${CYCLE_INTERVAL_MS / 1000}s`);
 console.log(`   Leverage:       x${LEVERAGE}`);
-console.log(`   Breakout pair:  ${BREAKOUT_SYMBOL}`);
+console.log(`   Breakout pair:  ${BREAKOUT_SYMBOL} (no ML)`);
 console.log(`   ML-Only pair:   ${MLONLY_SYMBOL} (fixed ${ML_ONLY_SIZE_BTC})`);
 console.log(`   ML URL:         ${ML_SERVICE_URL}`);
 console.log(
@@ -252,7 +257,7 @@ async function bootstrap() {
 
   console.log(`\n📋 Registered strategies:`);
   console.log(
-    `   1. ${breakoutStrategy.name} (${breakoutStrategy.id}) → ${BREAKOUT_SYMBOL}`,
+    `   1. ${breakoutStrategy.name} (${breakoutStrategy.id}) → ${BREAKOUT_SYMBOL} (no ML)`,
   );
   console.log(
     `   2. ${mlOnlyStrategy.name} (${mlOnlyStrategy.id}) → ${MLONLY_SYMBOL} fixed ${ML_ONLY_SIZE_BTC}`,
@@ -431,10 +436,12 @@ async function bootstrap() {
         await marketDataPoller.sync();
       }
 
-      // 2. Построить ДВА контекста: для BTC и для ETH параллельно
+      // 2. Построить ДВА контекста: для BTC и для ETH параллельно.
+      //    ETH-контекст собирается с skipML=true, т.к. модель на ETH
+      //    не обучена, а Breakout стратегия ML не использует.
       const [ctxML, ctxBreakout] = await Promise.all([
         contextBuilder.build({ symbol: MLONLY_SYMBOL }),
-        contextBuilder.build({ symbol: BREAKOUT_SYMBOL }),
+        contextBuilder.build({ symbol: BREAKOUT_SYMBOL, skipML: true }),
       ]);
 
       if (!ctxML || !ctxBreakout) {
@@ -454,7 +461,7 @@ async function bootstrap() {
       logCtxSummary(MLONLY_SYMBOL, ctxML);
       logCtxSummary(BREAKOUT_SYMBOL, ctxBreakout);
 
-      // 4. Прогнать Breakout (на ETH)
+      // 4. Прогнать Breakout (на ETH, без ML)
       console.log(`\n🔹 Breakout 1h [${BREAKOUT_SYMBOL}]:`);
       const breakoutResult = await runStrategy({
         strategy: breakoutStrategy,
