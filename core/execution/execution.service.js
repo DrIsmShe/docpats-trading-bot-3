@@ -20,21 +20,33 @@ import { BinanceFuturesClient } from "../providers/binanceFuturesClient.js";
  *      (Binance отклоняет STOP_MARKET через /fapi/v1/order — ошибка -4120)
  *
  * =================================================================
- * ЗАЩИТЫ ПРОТИВ КАСКАДНЫХ ФЕЙЛОВ (после инцидента 2026-04-23):
+ * ЗАЩИТЫ ПРОТИВ КАСКАДНЫХ ФЕЙЛОВ:
  * =================================================================
  *
- * [PROTECT #1] Увеличенный таймаут waitForOrderFill (20 сек)
- *   Было: 8 сек. При любой задержке сети или дрейфе времени — провал,
- *   даже если ордер фактически уже исполнен.
+ * [PROTECT #1] Большой таймаут waitForOrderFill (по умолчанию 60 сек)
+ *   Было: 8 сек, потом 20 сек. Этого недостаточно при сетевых лагах
+ *   или дрейфе времени. На 60 сек практически любой market-ордер
+ *   успевает дойти до окончательного статуса.
  *
  * [PROTECT #2] Пост-таймаут verify через getOrder() с ретраями
  *   Таймаут ≠ «ордер не исполнился». Это значит только «мы не смогли
- *   подтвердить за N сек». Перед выводом о провале — 3 доп. проверки.
+ *   подтвердить за N сек». Делаем ещё несколько проверок через getOrder
+ *   на конкретный orderId, прежде чем считать ордер провальным.
  *
- * [PROTECT #3] Verify позиции на бирже ПЕРЕД любым emergency close
- *   Если getPositions() показывает 0 — значит позиции нет (ордер не
- *   прошёл или уже закрылся), и слать close не нужно. Иначе риск
- *   переворота при ошибке reduceOnly или при двойной обработке.
+ * [PROTECT #3] КРИТИЧЕСКИЙ ФИКС 2026-04-26:
+ *   Failure handling работает по getOrder(orderId), а НЕ по getPositions().
+ *
+ *   Старый баг: при unknown-таймауте бот звал getPositions(), видел
+ *   суммарную позицию по символу (свою + ручную пользователя в One-Way
+ *   Mode) и закрывал всю её через market. Это закрывало ручные
+ *   позиции пользователя.
+ *
+ *   Сейчас: бот спрашивает Binance напрямую "что с НАШИМ ордером
+ *   #orderId?" Если FILLED → записываем в БД, успех. Если NEW/PARTIAL
+ *   → отменяем (cancelOrder). Если CANCELED/EXPIRED/REJECTED → ничего
+ *   не делать. Если статус не получен → НЕ ТРОГАЕМ ничего, шлём
+ *   Telegram-алерт. getPositions() в failure handling больше не
+ *   используется — бот трогает ТОЛЬКО свои ордера.
  *
  * [PROTECT #4] Circuit breaker per-symbol
  *   3 последовательных провала по одному символу → блок символа на
@@ -54,6 +66,13 @@ import { BinanceFuturesClient } from "../providers/binanceFuturesClient.js";
 const TIMESTAMP_ERROR_CODE = "-1021";
 const TIMESTAMP_ERROR_FRAGMENT = "recvWindow";
 
+// Коды ошибок Binance, которые означают "ордера уже нет" — безопасно игнорируем
+const ORDER_NOT_FOUND_FRAGMENTS = [
+  "-2011", // Unknown order sent
+  "Unknown order",
+  "Order does not exist",
+];
+
 export class ExecutionService {
   constructor({
     mode = "paper",
@@ -65,12 +84,14 @@ export class ExecutionService {
     symbolBlockMs = 30 * 60 * 1000, // → блок на 30 мин
     globalFailThreshold = 2, // 2 подряд -1021 ошибки
     globalBlockMs = 5 * 60 * 1000, // → блок на 5 мин
-    fillTimeoutMs = 20000, // 20 сек основной таймаут
+    // Fill polling
+    fillTimeoutMs = 60000, // 60 сек — основной таймаут (было 20)
     fillPollMs = 400, // интервал поллинга
     postTimeoutRetries = 3, // сколько раз ре-проверить через getOrder
-    postTimeoutRetryDelayMs = 1000,
-    // Telegram/observer hook. Вызывается при: open block, unblock.
+    postTimeoutRetryDelayMs = 2000, // 2 сек между ретраями (было 1)
+    // Telegram/observer hook. Вызывается при критичных событиях.
     onCircuitEvent = null,
+    onSafetyAlert = null, // (msg) => void — Telegram-алерт о неподтверждённом ордере
   } = {}) {
     this.mode = mode;
     this.positionStore = positionStore;
@@ -104,6 +125,8 @@ export class ExecutionService {
     this._postTimeoutRetryDelayMs = postTimeoutRetryDelayMs;
     this._onCircuitEvent =
       typeof onCircuitEvent === "function" ? onCircuitEvent : () => {};
+    this._onSafetyAlert =
+      typeof onSafetyAlert === "function" ? onSafetyAlert : () => {};
   }
 
   // ─── SYMBOL INFO CACHE ─────────────────────────────────────────
@@ -206,6 +229,11 @@ export class ExecutionService {
     );
   }
 
+  _isOrderNotFoundError(err) {
+    const msg = String(err?.message ?? err ?? "");
+    return ORDER_NOT_FOUND_FRAGMENTS.some((frag) => msg.includes(frag));
+  }
+
   _recordGlobalTimestampFailure(reason) {
     const cb = this._cb;
     cb.globalTimestampFailures++;
@@ -242,6 +270,14 @@ export class ExecutionService {
       this._onCircuitEvent(payload);
     } catch (e) {
       console.warn(`⚠️  onCircuitEvent handler failed: ${e.message}`);
+    }
+  }
+
+  _emitSafetyAlert(message) {
+    try {
+      this._onSafetyAlert(message);
+    } catch (e) {
+      console.warn(`⚠️  onSafetyAlert handler failed: ${e.message}`);
     }
   }
 
@@ -373,6 +409,8 @@ export class ExecutionService {
     const { symbol, type, stopLoss, takeProfit, leverage } = signal;
     const side = type;
 
+    let placedOrderId = null; // нужен в catch для финального резолва статуса
+
     try {
       // 1. Информация о символе
       const info = await this._getSymbolInfo(symbol);
@@ -437,20 +475,22 @@ export class ExecutionService {
       });
 
       const orderId = order.orderId;
+      placedOrderId = orderId;
       console.log(
         `📤 [${clientOrderPrefix}] Ордер отправлен #${orderId}, ждём fill...`,
       );
 
-      // 7. ДОЖДАТЬСЯ FILL [PROTECT #1 + PROTECT #2]
-      const filledOrder = await this._waitForFillWithVerify(
+      // 7. ДОЖДАТЬСЯ FILL [PROTECT #1 + PROTECT #2 + PROTECT #3]
+      const filledOrder = await this._resolveOrderOutcome(
         symbol,
         orderId,
         clientOrderPrefix,
       );
 
       if (!filledOrder.ok) {
-        // Надёжно определили что fill не произошёл → проверяем биржу и выходим
-        await this._handleOpenFailure(symbol, filledOrder.reason);
+        // _resolveOrderOutcome уже сделал безопасную обработку
+        // (cancel если ордер висел, alert если статус неизвестен).
+        // Никакого emergency close по getPositions().
         this._recordSymbolFailure(symbol, `open_fail: ${filledOrder.reason}`);
         return { ok: false, reason: filledOrder.reason };
       }
@@ -462,7 +502,13 @@ export class ExecutionService {
         console.error(
           `❌ Filled order has invalid data: ${JSON.stringify(filledOrder.data)}`,
         );
-        await this._handleOpenFailure(symbol, "invalid_fill_data");
+        // Не делаем emergency close — это не наш bug, а странный ответ Binance.
+        // Шлём алерт и записываем fail.
+        this._emitSafetyAlert(
+          `⚠️ ${symbol} — ордер #${orderId} вернул невалидные данные ` +
+            `(executedQty=${executedQty}, avgPrice=${avgPrice}). ` +
+            `Проверьте состояние позиции на бирже вручную.`,
+        );
         this._recordSymbolFailure(symbol, "invalid_fill_data");
         return { ok: false, reason: "Invalid fill data" };
       }
@@ -472,14 +518,6 @@ export class ExecutionService {
       );
 
       // [FIX #1] Пересчитать SL/TP от РЕАЛЬНОЙ цены исполнения.
-      //
-      // До фикса: SL/TP считались от signal.entry (last.close на момент сигнала).
-      // Если за время отправки ордера цена ушла — сохранённый SL мог оказаться
-      // вплотную к entry (или даже на неправильной стороне), что вызывало
-      // мгновенный SL на первом же тике PositionMonitor.
-      //
-      // После фикса: если стратегия передала slOffset/tpOffset — применяем их
-      // к avgPrice. Получаем стабильное расстояние SL/TP независимо от slippage.
       let finalSL = signalSL;
       let finalTP = signalTP;
       if (
@@ -530,8 +568,6 @@ export class ExecutionService {
         reason: signal.reason,
         clientOrderId,
         orderId: String(orderId),
-        // [FIX #3] fallback на signal.confidence для стратегий,
-        // которые не знают про поле mlConfidence (например Breakout)
         mlSignal: signal.mlSignal ?? "HOLD",
         mlConfidence: signal.mlConfidence ?? signal.confidence ?? 0,
       });
@@ -571,23 +607,45 @@ export class ExecutionService {
         this._recordSymbolFailure(symbol, `exchange_error: ${err.message}`);
       }
 
-      // [PROTECT #3] verify + safe close
-      await this._handleOpenFailure(symbol, err.message);
+      // [PROTECT #3] Если у нас есть orderId — пытаемся узнать его судьбу
+      // и обработать (cancel если висит / алерт если неизвестно).
+      // НЕ зовём getPositions() — не трогаем чужие позиции.
+      if (placedOrderId !== null) {
+        await this._tryResolveOrphanedOrder(
+          symbol,
+          placedOrderId,
+          err.message,
+        ).catch(() => {});
+      }
 
       return { ok: false, reason: `Exchange error: ${err.message}` };
     }
   }
 
-  // ─── FILL HANDLING ─────────────────────────────────────────────
+  // ─── ORDER OUTCOME RESOLUTION ──────────────────────────────────
 
   /**
-   * [PROTECT #1 + #2] Ждём fill с увеличенным таймаутом. Если таймаут истёк —
-   * делаем до N доп. проверок через getOrder() чтобы отделить «реально не
-   * исполнился» от «мы не смогли подтвердить».
+   * [PROTECT #1 + #2 + #3] Определить судьбу ордера и обработать БЕЗОПАСНО.
+   *
+   * Алгоритм:
+   *   1. waitForOrderFill (60 сек) — ждём FILLED
+   *   2. Если таймаут / ошибка → ещё N доп. проверок через getOrder
+   *      (с задержкой между ними), каждый раз только по нашему orderId
+   *   3. По финальному статусу:
+   *        FILLED              → ok: true (продолжаем нормально)
+   *        PARTIALLY_FILLED    → cancelOrder + ok: false (qty < expected)
+   *        NEW                 → cancelOrder + ok: false (был висящим)
+   *        CANCELED/EXPIRED/REJECTED → ok: false (без действий)
+   *        Не определили статус → ok: false + Telegram-алерт + НЕ трогаем биржу
    *
    * Возвращает { ok: true, data: orderLike } или { ok: false, reason }
+   *
+   * НИКОГДА не зовёт getPositions() и не закрывает чужие позиции.
    */
-  async _waitForFillWithVerify(symbol, orderId, clientOrderPrefix) {
+  async _resolveOrderOutcome(symbol, orderId, clientOrderPrefix) {
+    let lastKnownStatus = null;
+
+    // Стадия 1: основное ожидание fill через waitForOrderFill
     try {
       const filled = await this.binanceClient.waitForOrderFill(
         symbol,
@@ -595,155 +653,245 @@ export class ExecutionService {
         this._fillTimeoutMs,
         this._fillPollMs,
       );
+      // FILLED обработан внутри waitForOrderFill
       return { ok: true, data: filled };
     } catch (err) {
+      const msg = err?.message || "";
       console.warn(
-        `⚠️  [${clientOrderPrefix}] waitForOrderFill timeout/error: ${err.message}. Re-checking via getOrder...`,
+        `⚠️  [${clientOrderPrefix}] waitForOrderFill not confirmed: ${msg}. Re-checking #${orderId}...`,
       );
 
-      // Таймстемп ошибка — записываем в global breaker
       if (this._isTimestampError(err)) {
-        this._recordGlobalTimestampFailure(err.message);
+        this._recordGlobalTimestampFailure(msg);
       }
 
-      // Доп. проверки
-      for (let attempt = 1; attempt <= this._postTimeoutRetries; attempt++) {
-        await this._sleep(this._postTimeoutRetryDelayMs);
-        try {
-          const check = await this.binanceClient.getOrder(symbol, orderId);
+      // Если waitForOrderFill кинул конкретный финальный статус — берём его
+      const finalStatusInMsg = this._extractFinalStatusFromError(msg);
+      if (finalStatusInMsg) {
+        lastKnownStatus = finalStatusInMsg;
+      }
+    }
+
+    // Стадия 2: пост-таймаут ретраи через getOrder (только наш orderId)
+    let lastOrderData = null;
+    for (let attempt = 1; attempt <= this._postTimeoutRetries; attempt++) {
+      await this._sleep(this._postTimeoutRetryDelayMs);
+      try {
+        const check = await this.binanceClient.getOrder(symbol, orderId);
+        lastOrderData = check;
+        lastKnownStatus = check?.status ?? lastKnownStatus;
+
+        console.log(
+          `   🔎 post-timeout check ${attempt}/${this._postTimeoutRetries}: status=${check?.status}, executedQty=${check?.executedQty}`,
+        );
+
+        if (check?.status === "FILLED") {
           console.log(
-            `   🔎 post-timeout check ${attempt}/${this._postTimeoutRetries}: status=${check?.status}, executedQty=${check?.executedQty}`,
+            `   ✅ Order #${orderId} was actually filled — continuing normally.`,
           );
-          if (check?.status === "FILLED") {
-            console.log(
-              `   ✅ Order #${orderId} was actually filled — continuing normally.`,
-            );
-            return { ok: true, data: check };
-          }
-          if (
-            check?.status === "CANCELED" ||
-            check?.status === "EXPIRED" ||
-            check?.status === "REJECTED"
-          ) {
-            return {
-              ok: false,
-              reason: `order_${String(check.status).toLowerCase()}`,
-            };
-          }
-          // NEW / PARTIALLY_FILLED → ещё ждём
-        } catch (checkErr) {
-          console.warn(
-            `   ⚠️  post-timeout getOrder attempt ${attempt} failed: ${checkErr.message}`,
+          return { ok: true, data: check };
+        }
+
+        if (
+          check?.status === "CANCELED" ||
+          check?.status === "EXPIRED" ||
+          check?.status === "REJECTED"
+        ) {
+          // Финальный неуспешный статус — ничего отменять/закрывать не надо
+          return {
+            ok: false,
+            reason: `order_${String(check.status).toLowerCase()}`,
+          };
+        }
+
+        // NEW / PARTIALLY_FILLED — продолжаем проверять
+      } catch (checkErr) {
+        const cmsg = checkErr?.message || "";
+        console.warn(
+          `   ⚠️  post-timeout getOrder attempt ${attempt} failed: ${cmsg}`,
+        );
+        if (this._isTimestampError(checkErr)) {
+          this._recordGlobalTimestampFailure(cmsg);
+        }
+        // Не выходим — продолжим следующую попытку
+      }
+    }
+
+    // Стадия 3: обработка по последнему известному статусу
+    return await this._handleNonFilledOutcome(
+      symbol,
+      orderId,
+      lastKnownStatus,
+      lastOrderData,
+      clientOrderPrefix,
+    );
+  }
+
+  /**
+   * Парсит финальный статус из сообщения ошибки waitForOrderFill.
+   * Например: "Order 123 EXPIRED:" или "Order 123 CANCELED:"
+   */
+  _extractFinalStatusFromError(msg) {
+    if (!msg) return null;
+    const m = msg.match(/Order \d+ (FILLED|EXPIRED|CANCELED|REJECTED)/);
+    return m ? m[1] : null;
+  }
+
+  /**
+   * Обработка ордера с НЕ-FILLED финальным статусом.
+   *
+   * NEW / PARTIALLY_FILLED → cancelOrder, чтобы не получить отложенный fill
+   * Неизвестно           → НЕ трогать биржу, Telegram-алерт
+   */
+  async _handleNonFilledOutcome(
+    symbol,
+    orderId,
+    lastKnownStatus,
+    lastOrderData,
+    clientOrderPrefix,
+  ) {
+    const statusUpper = lastKnownStatus
+      ? String(lastKnownStatus).toUpperCase()
+      : null;
+
+    if (statusUpper === "NEW" || statusUpper === "PARTIALLY_FILLED") {
+      // Ордер ещё активен — отменяем, чтобы не висел и не fill'ился задним числом.
+      console.warn(
+        `   🛑 [${clientOrderPrefix}] Order #${orderId} still active (${statusUpper}). Cancelling...`,
+      );
+      try {
+        await this.binanceClient.cancelOrder(symbol, orderId);
+        console.warn(
+          `   ✅ [${clientOrderPrefix}] Order #${orderId} cancelled successfully.`,
+        );
+      } catch (cancelErr) {
+        const cmsg = cancelErr?.message || "";
+        if (this._isOrderNotFoundError(cancelErr)) {
+          // Ордер успел исполниться или был отменён биржей —
+          // в любом случае дополнительных действий не требуется.
+          console.log(
+            `   ℹ️  [${clientOrderPrefix}] Order #${orderId} already gone (${cmsg.slice(0, 80)}).`,
           );
-          if (this._isTimestampError(checkErr)) {
-            this._recordGlobalTimestampFailure(checkErr.message);
+        } else {
+          console.error(
+            `   ❌ [${clientOrderPrefix}] cancelOrder failed: ${cmsg}`,
+          );
+          this._emitSafetyAlert(
+            `❌ ${symbol} — не удалось отменить висящий ордер #${orderId}.\n` +
+              `Status: ${statusUpper}\n` +
+              `Error: ${cmsg}\n` +
+              `Проверьте Open Orders на Binance.`,
+          );
+          if (this._isTimestampError(cancelErr)) {
+            this._recordGlobalTimestampFailure(cmsg);
           }
         }
       }
 
+      // Если был частичный fill — об этом нужно знать,
+      // т.к. на бирже теперь висит маленькая позиция, которой нет в БД.
+      const executed = parseFloat(lastOrderData?.executedQty ?? 0);
+      if (executed > 0) {
+        this._emitSafetyAlert(
+          `⚠️ ${symbol} — partial fill при cancel: ` +
+            `${executed} (orderId ${orderId}). ` +
+            `На бирже теперь маленькая позиция, которой нет в БД. ` +
+            `Закройте вручную через Binance UI.`,
+        );
+        return {
+          ok: false,
+          reason: `partial_fill_cancelled: executed=${executed}`,
+        };
+      }
+
       return {
         ok: false,
-        reason: `Order fill unconfirmed after ${this._postTimeoutRetries} retries: ${err.message}`,
+        reason: `order_${statusUpper.toLowerCase()}_cancelled`,
       };
     }
+
+    if (
+      statusUpper === "CANCELED" ||
+      statusUpper === "EXPIRED" ||
+      statusUpper === "REJECTED"
+    ) {
+      // Ордер уже не активен и не исполнен — действий не требуется.
+      return { ok: false, reason: `order_${statusUpper.toLowerCase()}` };
+    }
+
+    // Статус неизвестен — НЕ ТРОГАЕМ биржу. Самый безопасный исход.
+    console.error(
+      `   🚨 [${clientOrderPrefix}] Cannot determine final status for #${orderId}. Sending alert, NOT touching positions.`,
+    );
+    this._emitSafetyAlert(
+      `🚨 ${symbol} — не удалось определить финальный статус ордера #${orderId}.\n` +
+        `Возможные исходы:\n` +
+        `  • ордер исполнился, и бот про это не знает (на бирже появилась позиция без записи в БД)\n` +
+        `  • ордер всё ещё висит\n` +
+        `Проверьте Order History и Open Orders на Binance.\n` +
+        `На следующем рестарте reconcileOnStartup пришлёт алерт об orphan-позиции если она есть.`,
+    );
+
+    return {
+      ok: false,
+      reason: `Order fill unconfirmed and final status unknown after ${this._postTimeoutRetries} retries`,
+    };
   }
 
-  // ─── FAILURE HANDLING / EMERGENCY CLOSE ─────────────────────────
-
   /**
-   * [PROTECT #3] Безопасная обработка провала открытия:
-   *   1. verify через getPositions() — что реально есть на бирже
-   *   2. если позиция ≠ 0 → closeMarketOrder (жёстко reduceOnly)
-   *   3. повторная verify после закрытия
+   * Вызывается из catch _executeLive, если произошла исключительная ошибка
+   * после отправки ордера. Делает best-effort попытку узнать судьбу нашего
+   * ордера и обработать (cancel если висит / алерт).
    *
-   * Не кидает — всё логирует. Если close не удался, просит ручного вмешательства.
+   * НЕ закрывает позиции и НЕ зовёт getPositions().
    */
-  async _handleOpenFailure(symbol, failReason) {
-    console.warn(
-      `🔎 [SAFETY] Verifying exchange state for ${symbol} after: ${failReason}`,
-    );
-
-    let positions;
+  async _tryResolveOrphanedOrder(symbol, orderId, originalErrorMessage) {
     try {
-      await this._sleep(500);
-      positions = await this.binanceClient.getPositions();
-    } catch (err) {
-      console.error(
-        `❌ [SAFETY] Cannot verify positions: ${err.message}. CANNOT safely emergency-close. Manual check required.`,
-      );
-      if (this._isTimestampError(err)) {
-        this._recordGlobalTimestampFailure(err.message);
-      }
-      return;
-    }
+      await this._sleep(1500);
+      const order = await this.binanceClient.getOrder(symbol, orderId);
+      const status = String(order?.status ?? "").toUpperCase();
 
-    const openPos = positions.find(
-      (p) => p.symbol === symbol && Math.abs(parseFloat(p.positionAmt)) > 0,
-    );
-
-    if (!openPos) {
-      console.log(
-        `   ✅ [SAFETY] No position on exchange for ${symbol} — nothing to close.`,
-      );
-      return;
-    }
-
-    const amt = parseFloat(openPos.positionAmt);
-    const qty = Math.abs(amt);
-    const posSide = amt > 0 ? "LONG" : "SHORT";
-    const closeSide = posSide === "LONG" ? "SELL" : "BUY";
-
-    console.warn(
-      `🚨 [SAFETY] Stray position on exchange: ${symbol} ${posSide} ${qty}. Emergency closing with reduceOnly...`,
-    );
-
-    await this._safeEmergencyClose(symbol, closeSide, qty);
-  }
-
-  /**
-   * Закрытие через closeMarketOrder (reduceOnly hardcoded в клиенте).
-   * После попытки — повторно verify позиции. Логирует результат явно.
-   */
-  async _safeEmergencyClose(symbol, closeSide, quantity) {
-    try {
-      await this.binanceClient.closeMarketOrder({
-        symbol,
-        side: closeSide,
-        quantity,
-        clientOrderId: `EMERGENCY_${Date.now()}`,
-      });
-      console.warn(
-        `   ✅ [SAFETY] Close order sent: ${symbol} ${closeSide} ${quantity}`,
-      );
-    } catch (err) {
-      console.error(
-        `   ❌ [SAFETY] closeMarketOrder failed: ${err.message}. Manual intervention required!`,
-      );
-      if (this._isTimestampError(err)) {
-        this._recordGlobalTimestampFailure(err.message);
-      }
-      return;
-    }
-
-    // Post-close verify
-    try {
-      await this._sleep(800);
-      const positions = await this.binanceClient.getPositions();
-      const stillOpen = positions.find(
-        (p) => p.symbol === symbol && Math.abs(parseFloat(p.positionAmt)) > 0,
-      );
-      if (stillOpen) {
-        console.error(
-          `   ❌ [SAFETY] Position STILL on exchange after close: amt=${stillOpen.positionAmt}. Manual intervention required!`,
+      if (status === "FILLED") {
+        // Ордер исполнился, но мы свалились до записи в БД.
+        // Алертим — пользователь должен знать.
+        const executed = parseFloat(order.executedQty ?? 0);
+        const avgPrice = parseFloat(order.avgPrice ?? 0);
+        this._emitSafetyAlert(
+          `🚨 ${symbol} — ордер #${orderId} исполнился (${executed} @ ${avgPrice}), ` +
+            `но запись в БД не создана из-за ошибки:\n${originalErrorMessage}\n` +
+            `На бирже открыта позиция без управления ботом. ` +
+            `На следующем рестарте reconcileOnStartup это обнаружит.`,
         );
-      } else {
-        console.log(
-          `   ✅ [SAFETY] Post-close verify OK: ${symbol} is flat on exchange.`,
-        );
+        return;
       }
+
+      if (status === "NEW" || status === "PARTIALLY_FILLED") {
+        // Висит — отменяем
+        try {
+          await this.binanceClient.cancelOrder(symbol, orderId);
+        } catch (cancelErr) {
+          if (!this._isOrderNotFoundError(cancelErr)) {
+            console.warn(`   ⚠️  Orphan cancel failed: ${cancelErr.message}`);
+          }
+        }
+        const executed = parseFloat(order.executedQty ?? 0);
+        if (executed > 0) {
+          this._emitSafetyAlert(
+            `⚠️ ${symbol} — partial fill (${executed}) у ордера #${orderId}, ` +
+              `которая повисла на бирже без записи в БД. Закройте вручную.`,
+          );
+        }
+        return;
+      }
+
+      // CANCELED / EXPIRED / REJECTED — ничего делать не нужно
     } catch (err) {
-      console.warn(
-        `   ⚠️  [SAFETY] Post-close verify failed: ${err.message}. Please check manually.`,
+      // getOrder упал — самый безопасный исход: алерт и без действий
+      this._emitSafetyAlert(
+        `⚠️ ${symbol} — после ошибки execute не удалось проверить ордер #${orderId}.\n` +
+          `Original error: ${originalErrorMessage}\n` +
+          `Status check error: ${err.message}\n` +
+          `Проверьте Order History на Binance.`,
       );
     }
   }
@@ -786,8 +934,11 @@ export class ExecutionService {
 
   /**
    * Ручное закрытие live-позиции.
-   * [FIX #4] closeMarketOrder — гарантированный reduceOnly=true в клиенте.
-   * [PROTECT #3] post-verify через getPositions.
+   *
+   * Закрывает ТОЛЬКО позицию, известную боту (по position.positionSize),
+   * через closeMarketOrder с reduceOnly=true. Это безопасно — reduceOnly
+   * на стороне Binance гарантирует, что ордер не превысит размер
+   * существующей позиции.
    */
   async closeLive(positionId, { exitReason = "MANUAL" } = {}) {
     if (this.mode !== "live" && this.mode !== "testnet") {
@@ -801,19 +952,20 @@ export class ExecutionService {
     }
 
     try {
-      await this.binanceClient.cancelAllOrders(position.symbol).catch((err) => {
-        console.warn(`⚠️  cancelAllOrders: ${err.message}`);
-      });
+      // Не зовём cancelAllOrders — это может отменить пользовательские
+      // SL/TP-ордера, которые висят на бирже отдельно от наших.
 
       const closeSide = position.side === "LONG" ? "SELL" : "BUY";
+      const closeOrderId = `CLOSE_${Date.now()}`;
+
       const closeOrder = await this.binanceClient.closeMarketOrder({
         symbol: position.symbol,
         side: closeSide,
         quantity: position.positionSize,
-        clientOrderId: `CLOSE_${Date.now()}`,
+        clientOrderId: closeOrderId,
       });
 
-      const fillRes = await this._waitForFillWithVerify(
+      const fillRes = await this._resolveOrderOutcome(
         position.symbol,
         closeOrder.orderId,
         "CLOSE",
@@ -821,43 +973,15 @@ export class ExecutionService {
 
       if (!fillRes.ok) {
         console.error(
-          `❌ closeLive: fill not confirmed. Running post-close verify...`,
+          `❌ closeLive: close order outcome unclear (${fillRes.reason}). Manual review required.`,
         );
-        // Проверим что позиция реально закрыта
-        try {
-          await this._sleep(800);
-          const positions = await this.binanceClient.getPositions();
-          const stillOpen = positions.find(
-            (p) =>
-              p.symbol === position.symbol &&
-              Math.abs(parseFloat(p.positionAmt)) > 0,
-          );
-          if (!stillOpen) {
-            console.log(
-              `   ✅ Position actually closed on exchange despite unconfirmed fill.`,
-            );
-            // Закроем в базе по последней известной цене
-            const exitPrice =
-              parseFloat(fillRes.data?.avgPrice) ||
-              parseFloat(
-                (await this.binanceClient.getPrice(position.symbol))?.price,
-              ) ||
-              position.entry;
-            return await this._finalizeLiveClose(
-              positionId,
-              position,
-              exitPrice,
-              exitReason,
-            );
-          }
-          console.error(
-            `   ❌ Position STILL on exchange. Manual check required.`,
-          );
-          return null;
-        } catch (e) {
-          console.error(`   ❌ Post-close verify failed: ${e.message}`);
-          return null;
-        }
+        this._emitSafetyAlert(
+          `❌ closeLive failed for ${position.symbol} ${position.side}\n` +
+            `Position id: ${positionId}\n` +
+            `Reason: ${fillRes.reason}\n` +
+            `Проверьте состояние позиции на бирже вручную.`,
+        );
+        return null;
       }
 
       const exitPrice = parseFloat(fillRes.data.avgPrice);
@@ -872,6 +996,11 @@ export class ExecutionService {
       if (this._isTimestampError(err)) {
         this._recordGlobalTimestampFailure(err.message);
       }
+      this._emitSafetyAlert(
+        `❌ closeLive exception for ${position.symbol} ${position.side}\n` +
+          `Position id: ${positionId}\n` +
+          `Error: ${err.message}`,
+      );
       return null;
     }
   }

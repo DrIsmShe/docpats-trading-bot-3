@@ -186,12 +186,8 @@ export class BinanceFuturesClient {
         throw err;
       }
     }
-    try {
-      await this._signedRequest("DELETE", "/fapi/v1/order", {
-        symbol,
-        orderId,
-      });
-    } catch (err) {}
+    // Не отменяем здесь — пусть вызывающий код решит, делать ли cancelOrder
+    // (например, мог получить FILLED уже после нашей последней проверки).
     throw new Error(
       `Order ${orderId} not filled within ${maxWaitMs}ms. Last status: ${lastOrder?.status ?? "unknown"}`,
     );
@@ -246,7 +242,7 @@ export class BinanceFuturesClient {
    *   - ордер только уменьшит/закроет существующую позицию
    *   - никогда не откроет обратную (flip → orphan)
    *
-   * Весь close-код в боте (PositionMonitor, emergency close, ручное
+   * Весь close-код в боте (PositionMonitor, partial close, ручное
    * закрытие по timeout) должен использовать этот метод, а не
    * placeMarketOrder напрямую.
    */
@@ -292,6 +288,39 @@ export class BinanceFuturesClient {
     return await this._signedRequest("POST", "/fapi/v1/order", params);
   }
 
+  /**
+   * Отменить ОДИН открытый ордер по orderId.
+   *
+   * Возвращает ответ Binance с финальным статусом ордера (обычно CANCELED).
+   * Если ордер уже исполнен / уже отменён — Binance вернёт ошибку с кодом
+   * -2011 (Unknown order sent), её можно безопасно игнорировать.
+   *
+   * Используется в ExecutionService при unconfirmed fill: если ордер
+   * висит как NEW или PARTIALLY_FILLED — отменяем, чтобы не получить
+   * отложенный fill через минуту.
+   */
+  async cancelOrder(symbol, orderId) {
+    return await this._signedRequest("DELETE", "/fapi/v1/order", {
+      symbol,
+      orderId,
+    });
+  }
+
+  async cancelAllOrders(symbol) {
+    return await this._signedRequest("DELETE", "/fapi/v1/allOpenOrders", {
+      symbol,
+    });
+  }
+
+  /**
+   * @deprecated Этот метод закрывает ВСЮ позицию по символу, что в
+   * One-Way Mode на Binance означает суммарную позицию (включая ручные
+   * сделки пользователя). Использовать ОПАСНО — может закрыть чужое.
+   *
+   * Не вызывать. Оставлено для обратной совместимости. Реальное закрытие
+   * только своих ордеров — через ExecutionService.closeLive() или
+   * PositionMonitor (они работают со своим orderId/positionSize).
+   */
   async closePosition(symbol) {
     const positions = await this.getPositions();
     const pos = positions.find((p) => p.symbol === symbol);
@@ -301,12 +330,6 @@ export class BinanceFuturesClient {
       symbol,
       side: closeSide,
       quantity: Math.abs(pos.positionAmt),
-    });
-  }
-
-  async cancelAllOrders(symbol) {
-    return await this._signedRequest("DELETE", "/fapi/v1/allOpenOrders", {
-      symbol,
     });
   }
 
