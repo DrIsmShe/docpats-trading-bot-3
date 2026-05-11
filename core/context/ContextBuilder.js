@@ -13,6 +13,10 @@
  * предсказания бессмысленны и приводят к ошибкам, если в БД недостаточно
  * свечей. В таких случаях передавайте skipML: true — ML-блок будет пустым
  * (enabled: false), стратегии это корректно игнорируют.
+ *
+ * [DERIVATIVES] Поле context.derivatives пробрасывается из MarketLoader
+ * без изменений. Это деривативные метрики (top_LS, crowd_LS, taker_ratio,
+ * openInterest с дельтами), нужны Confluence стратегии.
  */
 export class ContextBuilder {
   constructor({ marketLoader, mlClient = null, strategies = [] }) {
@@ -74,6 +78,7 @@ export class ContextBuilder {
       // Рыночные данные
       candles: market.candles ?? {},
       price: market.price ?? null,
+      change24hPct: market.change24hPct ?? 0,
       indicators: market.indicators ?? {},
       marketRegime: market.marketRegime ?? "UNKNOWN",
       htfTrend: market.htfTrend ?? "UNKNOWN",
@@ -95,6 +100,10 @@ export class ContextBuilder {
           reason: null,
         },
       },
+
+      // Деривативные метрики (для Confluence стратегии)
+      // Структура: { topLS, crowdLS, taker, openInterest } — каждое поле может быть null
+      derivatives: market.derivatives ?? null,
 
       // Счёт
       balances: market.balances ?? { spot: 0, futures: 0 },
