@@ -62,6 +62,7 @@ export class ConfluenceGate {
       passed: false,
       direction: null,
       score: better.score,
+      total: better.total,
       results: better.results,
       bestSide: better.direction, // какая сторона была ближе к прохождению
     };
