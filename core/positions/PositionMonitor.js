@@ -1,6 +1,27 @@
 /**
  * PositionMonitor — программный мониторинг SL/TP.
  *
+ * ─────────────────────────────────────────────────────────────────────
+ * ОБОБЩЁННАЯ ВЕРСИЯ:
+ *   Принимает массив stores произвольной длины, вместо захардкоженных
+ *   breakoutStore + mlOnlyStore. Это позволяет работать с N стратегиями
+ *   без изменения мониторинга.
+ *
+ * USAGE:
+ *   const monitor = new PositionMonitor({
+ *     binanceClient,
+ *     stores: [
+ *       { store: confluenceStore, name: "Confluence" },
+ *     ],
+ *     pollIntervalMs: 5000,
+ *     telegram,
+ *   });
+ *   monitor.start();
+ *
+ * Опционально можно передавать просто массив [store, store] — имя возьмётся
+ * из strategyId или будет "Strategy".
+ * ─────────────────────────────────────────────────────────────────────
+ *
  * Binance запрещает STOP_MARKET ордера через /fapi/v1/order (-4120),
  * поэтому SL/TP реализован программно:
  *   - Каждые N секунд запрашивает позиции с биржи (getPositions)
@@ -14,28 +35,41 @@
  *
  * [GAP #1] Reconcile в начале каждого _checkPosition: если позиция на
  *   бирже уже отсутствует — просто закрываем в БД, не шлём новый close.
- *   Это предотвращает бесконечный цикл "close → reduceOnly rejected (-2022)"
- *   после неудачной верификации на прошлом тике.
+ *   Это предотвращает бесконечный цикл "close → reduceOnly rejected (-2022)".
  *
  * [GAP #2] reconcileOnStartup() — вызывать один раз при старте бота,
- *   ДО запуска основного цикла. Убирает рассинхрон БД↔биржа после падений
- *   в момент между placeMarketOrder и store.close().
+ *   ДО запуска основного цикла.
  *
  * Запускается параллельно с основным циклом бота.
  */
 export class PositionMonitor {
   constructor({
     binanceClient,
-    breakoutStore,
-    mlOnlyStore,
-    pollIntervalMs = 5000, // проверка каждые 5 секунд
+    stores = [],
+    pollIntervalMs = 5000,
     telegram = null,
   }) {
+    if (!binanceClient) {
+      throw new Error("PositionMonitor: binanceClient required");
+    }
+    if (!Array.isArray(stores) || stores.length === 0) {
+      throw new Error("PositionMonitor: at least one store required");
+    }
+
     this.binanceClient = binanceClient;
-    this.stores = [
-      { store: breakoutStore, name: "Breakout" },
-      { store: mlOnlyStore, name: "ML-Only" },
-    ];
+
+    // Нормализуем формат: [{store, name}] либо [store, store, ...]
+    this.stores = stores.map((s, idx) => {
+      if (s && s.store) {
+        return { store: s.store, name: s.name ?? `Store${idx}` };
+      }
+      // Это просто store — пытаемся взять имя из strategyId
+      return {
+        store: s,
+        name: s.strategyId ?? `Store${idx}`,
+      };
+    });
+
     this.pollIntervalMs = pollIntervalMs;
     this.telegram = telegram;
     this._timer = null;
@@ -47,12 +81,12 @@ export class PositionMonitor {
 
   start() {
     if (this._timer) return;
+    const storeNames = this.stores.map((s) => s.name).join(", ");
     console.log(
-      `\n🛡️  PositionMonitor запущен (интервал: ${this.pollIntervalMs / 1000}s)`,
+      `\n🛡️  PositionMonitor запущен (интервал: ${this.pollIntervalMs / 1000}s, stores: [${storeNames}])`,
     );
     this._timer = setInterval(() => this._tick(), this.pollIntervalMs);
-    // Первый тик сразу
-    this._tick();
+    this._tick(); // первый тик сразу
   }
 
   stop() {
@@ -84,9 +118,7 @@ export class PositionMonitor {
    *
    * Два направления:
    *   1) DB OPEN, биржа пустая → закрываем в БД как RECONCILE_STARTUP
-   *      (бот упал между fill и store.close — восстанавливаем консистентность)
    *   2) Биржа OPEN, DB пустой → Telegram-алерт, НЕ закрываем автоматически
-   *      (бот не знает SL/TP/entry этой позиции — ручной разбор)
    */
   async reconcileOnStartup() {
     console.log(`\n🔧 PositionMonitor: startup reconcile...`);
@@ -100,8 +132,7 @@ export class PositionMonitor {
       if (this.telegram) {
         await this.telegram
           .send(
-            `⚠️ Startup reconcile skipped: getPositions() failed\n` +
-              `Error: ${err.message}`,
+            `⚠️ Startup reconcile skipped: getPositions() failed\nError: ${err.message}`,
           )
           .catch(() => {});
       }
@@ -124,7 +155,7 @@ export class PositionMonitor {
         const onExch = exchangePositions.find(
           (p) => p.symbol === pos.symbol && Math.abs(p.positionAmt) > 0,
         );
-        if (onExch) continue; // всё ОК, позиция реально открыта на бирже
+        if (onExch) continue; // позиция реально открыта на бирже
 
         try {
           const price = await this.binanceClient.getPrice(pos.symbol);
@@ -154,14 +185,14 @@ export class PositionMonitor {
       }
     }
 
-    // Направление 2: биржа OPEN, но в БД нет (ни в одной стратегии)
+    // Направление 2: биржа OPEN, но в БД нет ни в одном store
     const allDbSymbols = new Set();
     for (const { store } of this.stores) {
       try {
         const dbOpen = await store.getOpenPositions();
         dbOpen.forEach((p) => allDbSymbols.add(p.symbol));
       } catch (err) {
-        /* ignored, обработано выше */
+        /* ignored */
       }
     }
 
@@ -205,18 +236,11 @@ export class PositionMonitor {
 
   async _checkPosition(pos, store, strategyName) {
     try {
-      // [GAP #1] Reconcile-first: если позиции на бирже уже нет,
-      // закрываем в БД и выходим. Защита от бесконечного цикла
-      // "close → -2022 ReduceOnly rejected" после неудачной верификации.
-      //
-      // Также используем этот же вызов getPositions() как источник
-      // правды дальше — второй вызов в блоке верификации не нужен.
+      // [GAP #1] Reconcile-first
       let exchangePositions;
       try {
         exchangePositions = await this.binanceClient.getPositions();
       } catch (err) {
-        // Не смогли получить состояние биржи — лучше ничего не делать
-        // на этом тике, чем стрелять вслепую. Попробуем на следующем.
         console.warn(
           `⚠️  [${strategyName}] getPositions() failed: ${err.message}. Skip tick for ${pos.symbol}.`,
         );
@@ -228,9 +252,6 @@ export class PositionMonitor {
       );
 
       if (!onExchange) {
-        // Позиция в БД OPEN, на бирже — нет. Скорее всего предыдущий
-        // close-ордер отработал, но верификация на прошлом tick не
-        // успела это увидеть (eventual consistency Binance).
         const price = await this._getPrice(pos.symbol);
         const closed = await store.close(pos.id, {
           exitPrice: price,
@@ -285,8 +306,7 @@ export class PositionMonitor {
       const closeSide = side === "LONG" ? "SELL" : "BUY";
 
       try {
-        // [GAP #3] closeMarketOrder гарантирует reduceOnly=true на уровне
-        // метода — не может случайно перевернуть позицию в orphan.
+        // [GAP #3] closeMarketOrder гарантирует reduceOnly=true
         const order = await this.binanceClient.closeMarketOrder({
           symbol,
           side: closeSide,
@@ -304,8 +324,6 @@ export class PositionMonitor {
         const exitPrice = parseFloat(filled.avgPrice) || triggered.exitPrice;
 
         // Верификация: реально ли позиция закрыта на бирже?
-        // Если Binance ещё не успел обновить state — отпустим, следующий
-        // tick зайдёт в reconcile-ветку выше и корректно закроет в БД.
         let positionStillOpen = false;
         try {
           await new Promise((r) => setTimeout(r, 400));
@@ -329,8 +347,6 @@ export class PositionMonitor {
         }
 
         if (positionStillOpen) {
-          // НЕ закрываем в БД — следующий tick либо увидит позицию закрытой
-          // (reconcile-ветка) либо снова триггернёт close.
           if (this.telegram) {
             await this.telegram
               .send(
@@ -369,9 +385,6 @@ export class PositionMonitor {
             .catch(() => {});
         }
       } catch (closeErr) {
-        // Особый случай: -2022 ReduceOnly rejected означает, что позиции
-        // уже нет на бирже. Это не ошибка — это гонка. Следующий tick
-        // попадёт в reconcile-ветку и корректно закроет в БД.
         const msg = closeErr.message || "";
         const isReduceOnlyReject =
           msg.includes("-2022") ||

@@ -9,41 +9,13 @@ import { Position } from "../../app/db/Position.model.js";
  *   - Поддерживает фильтрацию по strategy (для двух ботов в одной БД)
  *   - Содержит поля для Binance integration (orderId, slOrderId, tpOrderId)
  *   - Совместим с одновременной работой нескольких стратегий
- *
- * ИСПОЛЬЗОВАНИЕ:
- *   const store = new MongoPositionStore({ strategyId: "breakout" });
- *
- *   // При открытии:
- *   const position = await store.open({
- *     symbol: "BTCUSDT",
- *     side: "LONG",
- *     entry: 73000,
- *     ...
- *   });
- *
- *   // Найти открытые позиции этой стратегии:
- *   const openPositions = await store.getOpenPositions();
- *
- *   // Закрыть позицию:
- *   await store.close(positionId, { exitPrice: 73500, exitReason: "TP" });
- *
- *   // Проверить cooldown после закрытия:
- *   const lastClosed = await store.getLastClosedPosition();
  */
 export class MongoPositionStore {
-  /**
-   * @param {object} options
-   * @param {string} [options.strategyId] - если задан, store работает ТОЛЬКО с позициями этой стратегии
-   */
   constructor({ strategyId = null } = {}) {
     this.strategyId = strategyId;
   }
 
-  /**
-   * Создать новую позицию в БД.
-   */
   async open(params) {
-    // side: LONG → BUY, SHORT → SELL (для совместимости с серверным ботом)
     const positionSide = params.side === "LONG" ? "BUY" : "SELL";
 
     const doc = await Position.create({
@@ -70,9 +42,6 @@ export class MongoPositionStore {
     return this._toDomain(doc);
   }
 
-  /**
-   * Закрыть позицию.
-   */
   async close(positionId, { exitPrice, exitReason }) {
     const position = await Position.findById(positionId);
     if (!position) {
@@ -89,13 +58,11 @@ export class MongoPositionStore {
       return null;
     }
 
-    // Вычисляем PnL
     const isLong = position.side === "BUY";
     const pnlPct = isLong
       ? (exitPrice - position.entryPrice) / position.entryPrice
       : (position.entryPrice - exitPrice) / position.entryPrice;
 
-    // PnL в USDT = pnlPct × notional
     const pnlUSDT = pnlPct * position.usdtAmount;
 
     position.exitPrice = exitPrice;
@@ -110,74 +77,56 @@ export class MongoPositionStore {
     return this._toDomain(position);
   }
 
-  /**
-   * Получить ВСЕ открытые позиции (с фильтром по strategyId если задан).
-   */
   async getOpenPositions() {
     const filter = { status: "OPEN" };
-    if (this.strategyId) {
-      filter.strategy = this.strategyId;
-    }
+    if (this.strategyId) filter.strategy = this.strategyId;
 
     const docs = await Position.find(filter).sort({ openedAt: -1 });
     return docs.map((d) => this._toDomain(d));
   }
 
-  /**
-   * Получить открытую позицию по символу (если есть).
-   */
   async getOpenPositionBySymbol(symbol) {
     const filter = { symbol, status: "OPEN" };
-    if (this.strategyId) {
-      filter.strategy = this.strategyId;
-    }
+    if (this.strategyId) filter.strategy = this.strategyId;
 
     const doc = await Position.findOne(filter);
     return doc ? this._toDomain(doc) : null;
   }
 
-  /**
-   * Получить открытую позицию по clientOrderId.
-   */
   async getOpenPositionByClientOrderId(clientOrderId) {
     const doc = await Position.findOne({ clientOrderId, status: "OPEN" });
     return doc ? this._toDomain(doc) : null;
   }
 
-  /**
-   * Найти позицию по _id (вернёт независимо от статуса).
-   */
   async getById(positionId) {
     const doc = await Position.findById(positionId);
     return doc ? this._toDomain(doc) : null;
   }
 
   /**
-   * [FIX #2] Получить последнюю ЗАКРЫТУЮ позицию этой стратегии.
-   * Используется в server.js для cooldown-проверки: после закрытия позиции
-   * бот не открывает новую в течение COOLDOWN_AFTER_CLOSE_MS (по умолчанию 15 мин).
-   *
-   * Это защита от whipsaw-серий вроде 19 апреля 17:52–17:59, когда бот за 7 минут
-   * открыл и закрыл 5 позиций, съев $0.37 на комиссиях и slippage.
-   *
-   * Игнорирует ERROR-записи (только реальные закрытия) — их тоже считать было бы
-   * неверно, потому что ERROR-позиции фактически не открывались на бирже.
-   *
-   * @returns {Promise<object|null>} domain-объект позиции или null если нет закрытых
+   * [FIX #2] Последняя ЗАКРЫТАЯ позиция этой стратегии (по всем символам).
+   * Используется для global cooldown (если применимо).
    */
   async getLastClosedPosition() {
     const filter = { status: "CLOSED" };
-    if (this.strategyId) {
-      filter.strategy = this.strategyId;
-    }
+    if (this.strategyId) filter.strategy = this.strategyId;
     const doc = await Position.findOne(filter).sort({ closedAt: -1 });
     return doc ? this._toDomain(doc) : null;
   }
 
   /**
-   * Обновить связь с биржей (orderId, slOrderId, tpOrderId).
-   * Используется когда сначала создали запись в Mongo, потом получили ответ от Binance.
+   * [NEW] Последняя ЗАКРЫТАЯ позиция по конкретному символу.
+   * Используется для per-symbol cooldown в multi-symbol стратегиях
+   * (Confluence): когда BTC закрылся — пауза на BTC, но ETH можно
+   * торговать сразу.
    */
+  async getLastClosedPositionBySymbol(symbol) {
+    const filter = { symbol, status: "CLOSED" };
+    if (this.strategyId) filter.strategy = this.strategyId;
+    const doc = await Position.findOne(filter).sort({ closedAt: -1 });
+    return doc ? this._toDomain(doc) : null;
+  }
+
   async updateExchangeIds(positionId, { orderId, slOrderId, tpOrderId }) {
     const update = {};
     if (orderId !== undefined) update.orderId = orderId;
@@ -187,9 +136,6 @@ export class MongoPositionStore {
     await Position.updateOne({ _id: positionId }, { $set: update });
   }
 
-  /**
-   * Пометить позицию как ERROR (что-то пошло не так при открытии).
-   */
   async markError(positionId, errorMessage) {
     await Position.updateOne(
       { _id: positionId },
@@ -203,14 +149,9 @@ export class MongoPositionStore {
     );
   }
 
-  /**
-   * Получить статистику по закрытым позициям этой стратегии.
-   */
   async getStats() {
     const filter = { status: "CLOSED" };
-    if (this.strategyId) {
-      filter.strategy = this.strategyId;
-    }
+    if (this.strategyId) filter.strategy = this.strategyId;
 
     const closed = await Position.find(filter);
 
@@ -226,10 +167,9 @@ export class MongoPositionStore {
     const profitFactor =
       totalLoss > 0 ? totalProfit / totalLoss : totalProfit > 0 ? 99 : 0;
 
-    const openPositions = await Position.countDocuments({
-      ...filter,
-      status: "OPEN",
-    });
+    const openFilter = { status: "OPEN" };
+    if (this.strategyId) openFilter.strategy = this.strategyId;
+    const openPositions = await Position.countDocuments(openFilter);
 
     return {
       totalTrades,
@@ -243,9 +183,54 @@ export class MongoPositionStore {
   }
 
   /**
-   * Преобразовать Mongo document в domain объект.
-   * Domain объект — это тот формат который ожидает остальной код (ExecutionService, PositionMonitor).
+   * [NEW] Per-symbol breakdown статистики.
+   * Полезно для confluence: видеть какой символ работает лучше.
    */
+  async getStatsBySymbol() {
+    const filter = { status: "CLOSED" };
+    if (this.strategyId) filter.strategy = this.strategyId;
+
+    const closed = await Position.find(filter);
+    const bySymbol = new Map();
+
+    for (const p of closed) {
+      const sym = p.symbol;
+      if (!bySymbol.has(sym)) {
+        bySymbol.set(sym, {
+          symbol: sym,
+          trades: 0,
+          wins: 0,
+          losses: 0,
+          totalPnL: 0,
+          totalProfit: 0,
+          totalLoss: 0,
+        });
+      }
+      const s = bySymbol.get(sym);
+      s.trades++;
+      const pnl = p.pnlUSDT ?? 0;
+      s.totalPnL += pnl;
+      if (pnl > 0) {
+        s.wins++;
+        s.totalProfit += pnl;
+      } else {
+        s.losses++;
+        s.totalLoss += Math.abs(pnl);
+      }
+    }
+
+    return Array.from(bySymbol.values()).map((s) => ({
+      ...s,
+      winRate: s.trades > 0 ? (s.wins / s.trades) * 100 : 0,
+      profitFactor:
+        s.totalLoss > 0
+          ? s.totalProfit / s.totalLoss
+          : s.totalProfit > 0
+            ? 99
+            : 0,
+    }));
+  }
+
   _toDomain(doc) {
     return {
       id: doc._id.toString(),

@@ -1,34 +1,30 @@
 /**
- * btc-bot-v3 — Modular Trading Platform (LIVE)
+ * btc-bot-v3 — Confluence Trading Bot (LIVE)
  *
- * Server entry point.
+ * ОДНА стратегия (Confluence) на НЕСКОЛЬКИХ символах одновременно.
  *
- * Две стратегии работают параллельно на РАЗНЫХ символах:
- *   1. Breakout 1h — trend following (ETHUSDT по умолчанию, БЕЗ ML)
- *   2. ML-Only    — нейросеть (BTCUSDT — ML обучена на BTC)
+ * АРХИТЕКТУРА:
+ *   server.js cycle:
+ *     for each symbol in [BTC, ETH, AVAX, LINK]:
+ *       1. cooldown check (per-symbol)
+ *       2. open-position check (per-symbol)
+ *       3. tradingEngine.run({ symbol })
+ *            → ContextBuilder → ConfluenceStrategy → SignalAggregator
+ *            → RiskManager (учитывает meta.fixedSize) → ExecutionService
  *
- * Такое распределение полностью исключает конфликт стратегий:
- *   - Нет ситуации "одна даёт LONG, вторая SHORT на одном символе"
- *   - Binance держит их как 2 независимые позиции (разные символы)
- *   - ML-модель используется только на BTC (на котором обучена)
+ * ПОЗИЦИИ:
+ *   Один MongoPositionStore { strategyId: "confluence" } хранит все позиции
+ *   по всем 4 символам. PositionMonitor мониторит этот store целиком.
  *
- * [ML SCOPE] ML-контекст собирается ТОЛЬКО для MLONLY_SYMBOL (BTC).
- * Для BREAKOUT_SYMBOL (ETH) контекст строится с skipML=true — стратегия
- * Breakout ML не использует, а модель для ETH не обучена, так что
- * бесполезные /predict запросы только спамили бы error.log.
- *
- * Каждая стратегия имеет:
- *   - Свой символ (через .env: BREAKOUT_SYMBOL, MLONLY_SYMBOL)
- *   - Свой MongoPositionStore (фильтр по strategyId)
- *   - Свой префикс для clientOrderId (BRK_ и ML_)
+ * ML:
+ *   Используется как size modifier (1.0x — 2.0x baseline) только для BTCUSDT.
+ *   На остальных символах ML не вызывается, multiplier всегда 1.0.
  *
  * РЕЖИМЫ (через .env):
  *   TRADING_MODE=paper  → симуляция, позиции в памяти
  *   TRADING_MODE=live   → реальная торговля на Binance
  *
- * [GAP #2] При старте в live/testnet режиме выполняется reconcile состояния:
- *   сверка открытых позиций в БД с реальным состоянием на бирже.
- *   Это защита от рассинхрона после падений/рестартов.
+ * При старте в live режиме выполняется reconcileOnStartup — сверка БД↔биржа.
  */
 
 import "dotenv/config";
@@ -42,13 +38,17 @@ import { AccountProvider } from "./core/providers/accountProvider.js";
 import { PositionProvider } from "./core/providers/positionProvider.js";
 import { RegimeProvider } from "./core/providers/regimeProvider.js";
 import { MarketContextProvider } from "./core/providers/marketContextProvider.js";
+import { DerivativesProvider } from "./core/providers/derivativesProvider.js";
 
-// Core modules
+// Core
 import { MarketLoader } from "./core/market/marketLoader.js";
 import { MarketDataPoller } from "./core/market/marketDataPoller.js";
 import { ContextBuilder } from "./core/context/ContextBuilder.js";
 import { RiskManager } from "./core/risk/RiskManager.js";
 import { ExecutionService } from "./core/execution/execution.service.js";
+import { StrategyManager } from "./core/strategy/StrategyManager.js";
+import { SignalAggregator } from "./core/signal/SignalAggregator.js";
+import { TradingEngine } from "./core/engine/TradingEngine.js";
 import { MongoPositionStore } from "./core/positions/MongoPositionStore.js";
 import { PaperPositionStore } from "./core/positions/PaperPositionStore.js";
 import { PositionMonitor } from "./core/positions/PositionMonitor.js";
@@ -56,82 +56,46 @@ import { PositionMonitor } from "./core/positions/PositionMonitor.js";
 // ML
 import { MLClient } from "./core/ml/MLClient.js";
 
-// Strategies
-import { BreakoutStrategy } from "./strategies/breakout/breakout.strategy.js";
-import { MLOnlyStrategy } from "./strategies/mlOnly/mlOnly.strategy.js";
+// Strategy
+import { ConfluenceStrategy } from "./strategies/confluence/confluence.strategy.js";
 
 // ── Configuration ──────────────────────────────────────────────────
 const MODE = process.env.TRADING_MODE || "paper";
 const CYCLE_INTERVAL_MS = parseInt(process.env.CYCLE_INTERVAL_MS || "60000");
 const LEVERAGE = parseInt(process.env.LEVERAGE || "10");
 
-// [MULTI-SYMBOL] Разные символы для разных стратегий.
-// Breakout на ETH (без ML), ML-Only на BTC (модель натренирована на BTC).
-const BREAKOUT_SYMBOL = process.env.BREAKOUT_SYMBOL || "ETHUSDT";
-const MLONLY_SYMBOL = process.env.MLONLY_SYMBOL || "BTCUSDT";
+// Multi-symbol: confluence работает на 4 символах одновременно
+const SYMBOLS = (
+  process.env.CONFLUENCE_SYMBOLS || "BTCUSDT,ETHUSDT,AVAXUSDT,LINKUSDT"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
-// Cooldown после закрытия позиции
+// Cooldown per-symbol (минут после закрытия позиции на этом символе)
 const COOLDOWN_AFTER_CLOSE_MS = parseInt(
-  process.env.COOLDOWN_AFTER_CLOSE_MS || "900000",
+  process.env.COOLDOWN_AFTER_CLOSE_MS || "900000", // 15 минут
 );
 
-// Размер позиции ML-Only в базовом активе (BTC)
-const ML_ONLY_SIZE_BTC = parseFloat(process.env.ML_ONLY_SIZE_BTC || "0.002");
+// Daily loss limit (USDT)
+const DAILY_LOSS_LIMIT = parseFloat(process.env.DAILY_LOSS_LIMIT || "50");
 
 // ML service
 const ML_SERVICE_URL = process.env.ML_SERVICE_URL || "http://localhost:3001";
 
-// Daily loss limits
-const BREAKOUT_DAILY_LOSS_LIMIT = parseFloat(
-  process.env.BREAKOUT_DAILY_LOSS_LIMIT || "50",
-);
-const MLONLY_DAILY_LOSS_LIMIT = parseFloat(
-  process.env.MLONLY_DAILY_LOSS_LIMIT || "20",
-);
-
-// Phase 1 filters
-const ML_MIN_CONFIDENCE = parseFloat(process.env.ML_MIN_CONFIDENCE || "0.55");
-const FUNDING_THRESHOLD_PCT = parseFloat(
-  process.env.FUNDING_THRESHOLD_PCT || "0.05",
-);
-const CONTRA_FUNDING_BOOST = parseFloat(
-  process.env.CONTRA_FUNDING_BOOST || "0.10",
-);
-const RISKY_HOUR_BOOST = parseFloat(process.env.RISKY_HOUR_BOOST || "0.10");
-const BREAKOUT_CONTRA_FUNDING_VOL_BOOST = parseFloat(
-  process.env.BREAKOUT_CONTRA_FUNDING_VOL_BOOST || "0.30",
-);
-const BREAKOUT_RISKY_HOUR_VOL_BOOST = parseFloat(
-  process.env.BREAKOUT_RISKY_HOUR_VOL_BOOST || "0.30",
-);
-
-// [ETH] Breakout настроен строже для ETH по умолчанию:
-// minVolatilityPct 0.30 (вместо 0.18), т.к. ETH ATR% обычно выше.
-// Переопределяется через .env: BREAKOUT_MIN_VOLATILITY_PCT
-const BREAKOUT_MIN_VOLATILITY_PCT = parseFloat(
-  process.env.BREAKOUT_MIN_VOLATILITY_PCT || "0.30",
-);
-
+// ── Banner ─────────────────────────────────────────────────────────
 console.log("═".repeat(70));
-console.log("🚀 btc-bot-v3 — Modular Trading Platform (Multi-Symbol)");
+console.log("🚀 btc-bot-v3 — Confluence Strategy (Multi-Symbol)");
 console.log("═".repeat(70));
-console.log(`   Mode:           ${MODE.toUpperCase()}`);
-console.log(`   Interval:       ${CYCLE_INTERVAL_MS / 1000}s`);
-console.log(`   Leverage:       x${LEVERAGE}`);
-console.log(`   Breakout pair:  ${BREAKOUT_SYMBOL} (no ML)`);
-console.log(`   ML-Only pair:   ${MLONLY_SYMBOL} (fixed ${ML_ONLY_SIZE_BTC})`);
-console.log(`   ML URL:         ${ML_SERVICE_URL}`);
+console.log(`   Mode:            ${MODE.toUpperCase()}`);
+console.log(`   Interval:        ${CYCLE_INTERVAL_MS / 1000}s`);
+console.log(`   Leverage:        x${LEVERAGE}`);
+console.log(`   Symbols:         [${SYMBOLS.join(", ")}]`);
+console.log(`   ML URL:          ${ML_SERVICE_URL}`);
 console.log(
-  `   Cooldown:       ${COOLDOWN_AFTER_CLOSE_MS === 0 ? "disabled" : Math.round(COOLDOWN_AFTER_CLOSE_MS / 60000) + "min after close"}`,
+  `   Cooldown:        ${COOLDOWN_AFTER_CLOSE_MS === 0 ? "disabled" : Math.round(COOLDOWN_AFTER_CLOSE_MS / 60000) + "min per-symbol"}`,
 );
-console.log(`   ML minConf:     ${ML_MIN_CONFIDENCE}`);
-console.log(`   Funding thr:    ±${FUNDING_THRESHOLD_PCT}%`);
-console.log(
-  `   Boosts:         contra-funding +${(CONTRA_FUNDING_BOOST * 100).toFixed(0)}% | risky-hour +${(RISKY_HOUR_BOOST * 100).toFixed(0)}%`,
-);
-console.log(
-  `   Breakout ATR%:  ${BREAKOUT_MIN_VOLATILITY_PCT} min (ETH-adapted)`,
-);
+console.log(`   Daily loss:      $${DAILY_LOSS_LIMIT}`);
 console.log("═".repeat(70));
 
 async function bootstrap() {
@@ -181,24 +145,25 @@ async function bootstrap() {
     console.warn(`\n⚠️  ML-Service недоступен на ${ML_SERVICE_URL}`);
   }
 
-  // ── 4. Market Data Poller — качает свечи для ОБОИХ символов ─────
-  // Уникальные символы (на случай если BREAKOUT_SYMBOL === MLONLY_SYMBOL)
-  const allSymbols = [...new Set([BREAKOUT_SYMBOL, MLONLY_SYMBOL])];
+  // ── 4. Market Data Poller ───────────────────────────────────────
   let marketDataPoller = null;
   if (MODE === "live" || MODE === "testnet") {
     marketDataPoller = new MarketDataPoller({
       binanceClient,
-      symbols: allSymbols,
+      symbols: SYMBOLS,
       intervals: ["1h", "4h", "1d"],
     });
-    console.log(`\n📥 MarketDataPoller: symbols=[${allSymbols.join(", ")}]`);
+    console.log(`\n📥 MarketDataPoller: symbols=[${SYMBOLS.join(", ")}]`);
   }
 
-  // ── 5. Providers (shared между стратегиями) ─────────────────────
+  // ── 5. Providers ────────────────────────────────────────────────
   const candleProvider = new CandleProvider();
   const indicatorProvider = new IndicatorProvider();
   const regimeProvider = new RegimeProvider();
   const marketContextProvider = new MarketContextProvider({
+    cacheTtlMs: 60_000,
+  });
+  const derivativesProvider = new DerivativesProvider({
     cacheTtlMs: 60_000,
   });
 
@@ -207,81 +172,41 @@ async function bootstrap() {
       ? new AccountProvider({ mode: "live", binanceClient, cacheTtlMs: 30_000 })
       : new AccountProvider({ mode: "mock", mockBalance: 144 });
 
-  // ── 6. Position Stores (по одному на стратегию) ─────────────────
-  const breakoutStore =
+  // ── 6. Position store (один на стратегию, фильтр по strategyId) ─
+  const confluenceStore =
     MODE === "live" || MODE === "testnet"
-      ? new MongoPositionStore({ strategyId: "breakout" })
+      ? new MongoPositionStore({ strategyId: "confluence" })
       : new PaperPositionStore();
 
-  const mlOnlyStore =
-    MODE === "live" || MODE === "testnet"
-      ? new MongoPositionStore({ strategyId: "mlOnly" })
-      : new PaperPositionStore();
-
-  // ── 7. Execution Services ───────────────────────────────────────
-  const breakoutExecution = new ExecutionService({
-    mode: MODE,
-    positionStore: breakoutStore,
-    binanceClient,
+  // ── 7. Position provider ────────────────────────────────────────
+  const positionProvider = new PositionProvider({
+    mode: MODE === "paper" ? "paper" : "mongo",
+    store: confluenceStore,
   });
-  const mlOnlyExecution = new ExecutionService({
+
+  // ── 8. Execution service ────────────────────────────────────────
+  const execution = new ExecutionService({
     mode: MODE,
-    positionStore: mlOnlyStore,
+    positionStore: confluenceStore,
     binanceClient,
   });
 
+  // ── 9. Position Monitor (обобщённый под массив stores) ──────────
   const positionMonitor = new PositionMonitor({
     binanceClient,
-    breakoutStore,
-    mlOnlyStore,
+    stores: [{ store: confluenceStore, name: "Confluence" }],
     pollIntervalMs: 5000,
   });
 
-  // ── 8. Strategies ───────────────────────────────────────────────
-  const breakoutStrategy = new BreakoutStrategy({
-    fundingThresholdPct: FUNDING_THRESHOLD_PCT,
-    contraFundingVolBoost: BREAKOUT_CONTRA_FUNDING_VOL_BOOST,
-    riskyHourVolBoost: BREAKOUT_RISKY_HOUR_VOL_BOOST,
-    minVolatilityPct: BREAKOUT_MIN_VOLATILITY_PCT,
-  });
-  const mlOnlyStrategy = new MLOnlyStrategy({
-    mlClient,
-    minConfidence: ML_MIN_CONFIDENCE,
-    atrMultiplierSL: 1.5,
-    atrMultiplierTP: 3.0,
-    maxHoldCandles: 24,
-    fundingThresholdPct: FUNDING_THRESHOLD_PCT,
-    contraFundingBoost: CONTRA_FUNDING_BOOST,
-    riskyHourBoost: RISKY_HOUR_BOOST,
-  });
+  // ── 10. Strategy ────────────────────────────────────────────────
+  const confluenceStrategy = new ConfluenceStrategy({ mlClient });
 
-  console.log(`\n📋 Registered strategies:`);
+  console.log(`\n📋 Registered strategy:`);
   console.log(
-    `   1. ${breakoutStrategy.name} (${breakoutStrategy.id}) → ${BREAKOUT_SYMBOL} (no ML)`,
-  );
-  console.log(
-    `   2. ${mlOnlyStrategy.name} (${mlOnlyStrategy.id}) → ${MLONLY_SYMBOL} fixed ${ML_ONLY_SIZE_BTC}`,
+    `   ${confluenceStrategy.name} (${confluenceStrategy.id}) → [${SYMBOLS.join(", ")}]`,
   );
 
-  // ── 9. Risk Manager ─────────────────────────────────────────────
-  const breakoutRiskManager = new RiskManager({
-    riskPerTrade: 0.01,
-    minBalance: 10,
-    maxPositionPctOfBalance: 5,
-    minPositionUSDT: 5,
-  });
-
-  // ── 10. Position provider + per-symbol ContextBuilder ───────────
-  //
-  // ВАЖНО: ContextBuilder принимает symbol в build(), поэтому один инстанс
-  // подходит для обоих символов. PositionProvider тоже вызывается с
-  // симовлом при запросе открытых позиций.
-
-  const positionProvider = new PositionProvider({
-    mode: MODE === "paper" ? "paper" : "mongo",
-    store: breakoutStore, // для контекста достаточно одного; каждая стратегия всё равно использует свой store
-  });
-
+  // ── 11. Market Loader + Context Builder ─────────────────────────
   const marketLoader = new MarketLoader({
     candleProvider,
     indicatorProvider,
@@ -289,19 +214,44 @@ async function bootstrap() {
     positionProvider,
     regimeProvider,
     marketContextProvider,
+    derivativesProvider,
   });
 
+  // ContextBuilder.mlClient = null, потому что ML вызывается прямо
+  // из ConfluenceStrategy (там сложнее логика согласия с Gate)
   const contextBuilder = new ContextBuilder({
     marketLoader,
-    mlClient,
-    strategies: [breakoutStrategy, mlOnlyStrategy],
+    mlClient: null,
+    strategies: [confluenceStrategy],
   });
 
-  // ── 11. Daily stats ─────────────────────────────────────────────
+  // ── 12. Strategy Manager + Aggregator + Risk + Engine ───────────
+  const strategyManager = new StrategyManager({
+    strategies: [confluenceStrategy],
+  });
+
+  const signalAggregator = new SignalAggregator({ minConfidence: 0.5 });
+
+  const riskManager = new RiskManager({
+    riskPerTrade: 0.01,
+    minBalance: 10,
+    maxPositionPctOfBalance: 5,
+    minPositionUSDT: 5,
+  });
+
+  const tradingEngine = new TradingEngine({
+    contextBuilder,
+    strategyManager,
+    signalAggregator,
+    riskManager,
+    executionService: execution,
+    positionMonitor: null, // мониторинг отдельным фоновым процессом
+  });
+
+  // ── 13. Daily stats ─────────────────────────────────────────────
   const dailyStats = {
     date: new Date().toISOString().slice(0, 10),
-    breakoutPnL: 0,
-    mlOnlyPnL: 0,
+    pnL: 0,
   };
 
   const resetDailyStatsIfNewDay = () => {
@@ -309,110 +259,37 @@ async function bootstrap() {
     if (today !== dailyStats.date) {
       console.log(`\n📅 New day: ${today}, resetting daily stats`);
       dailyStats.date = today;
-      dailyStats.breakoutPnL = 0;
-      dailyStats.mlOnlyPnL = 0;
+      dailyStats.pnL = 0;
     }
   };
 
-  const isBreakoutStopped = () =>
-    dailyStats.breakoutPnL <= -BREAKOUT_DAILY_LOSS_LIMIT;
-  const isMlOnlyStopped = () =>
-    dailyStats.mlOnlyPnL <= -MLONLY_DAILY_LOSS_LIMIT;
+  const isStoppedByDailyLoss = () => dailyStats.pnL <= -DAILY_LOSS_LIMIT;
 
-  // ── 12. Strategy runner ─────────────────────────────────────────
-  async function runStrategy({
-    strategy,
-    store,
-    execution,
-    ctx,
-    clientOrderPrefix,
-    fixedSize = null,
-  }) {
-    const strategyId = strategy.id;
-
-    if (strategyId === "breakout" && isBreakoutStopped()) {
-      return { skipped: "daily_loss_limit" };
+  // ── 14. Per-symbol cooldown check ───────────────────────────────
+  async function isInCooldown(symbol) {
+    if (COOLDOWN_AFTER_CLOSE_MS <= 0) return null;
+    if (typeof confluenceStore.getLastClosedPositionBySymbol !== "function") {
+      // Paper store не имеет этого метода — пропускаем cooldown
+      return null;
     }
-    if (strategyId === "mlOnly" && isMlOnlyStopped()) {
-      return { skipped: "daily_loss_limit" };
-    }
+    const lastClosed =
+      await confluenceStore.getLastClosedPositionBySymbol(symbol);
+    if (!lastClosed?.closedAt) return null;
 
-    const openPositions = await store.getOpenPositions();
-    if (openPositions.length > 0) {
-      return { skipped: "already_has_open_position" };
-    }
+    const sinceCloseMs = Date.now() - new Date(lastClosed.closedAt).getTime();
+    if (sinceCloseMs >= COOLDOWN_AFTER_CLOSE_MS) return null;
 
-    // Cooldown
-    if (COOLDOWN_AFTER_CLOSE_MS > 0) {
-      const lastClosed = await store.getLastClosedPosition();
-      if (lastClosed?.closedAt) {
-        const sinceCloseMs =
-          Date.now() - new Date(lastClosed.closedAt).getTime();
-        if (sinceCloseMs < COOLDOWN_AFTER_CLOSE_MS) {
-          const remainingSec = Math.ceil(
-            (COOLDOWN_AFTER_CLOSE_MS - sinceCloseMs) / 1000,
-          );
-          const remainingLabel =
-            remainingSec >= 60
-              ? `${Math.ceil(remainingSec / 60)}min`
-              : `${remainingSec}s`;
-          return {
-            skipped: `cooldown_${remainingLabel}_after_${lastClosed.exitReason ?? "close"}`,
-          };
-        }
-      }
-    }
-
-    const signal = await strategy.generateSignal(ctx);
-    if (signal.type === "HOLD") {
-      return { action: "HOLD", reason: signal.reason };
-    }
-
-    let riskedSignal;
-    if (fixedSize !== null) {
-      // ML-Only: фиксированный размер (в базовом активе)
-      const positionSize = fixedSize;
-      const notional = positionSize * signal.entry;
-      const requiredMargin = notional / LEVERAGE;
-
-      riskedSignal = {
-        ...signal,
-        allowed: true,
-        positionSize,
-        positionNotional: notional,
-        requiredMargin,
-        leverage: LEVERAGE,
-      };
-    } else {
-      // Breakout: риск-менеджер по балансу
-      const balances = await accountProvider.getBalances();
-      const plan = breakoutRiskManager.buildPlan({
-        signal,
-        balance: balances.futures,
-        leverage: LEVERAGE,
-      });
-
-      if (!plan.allowed) {
-        return { action: "REJECTED", reason: plan.reason };
-      }
-
-      riskedSignal = {
-        ...signal,
-        ...plan,
-      };
-    }
-
-    const result = await execution.execute(riskedSignal, { clientOrderPrefix });
-
-    if (!result.ok) {
-      console.warn(`\n⚠️  [${strategyId}] Execution failed: ${result.reason}`);
-      return { action: "FAILED", reason: result.reason };
-    }
-
-    return { action: "OPENED", position: result.position };
+    const remainingSec = Math.ceil(
+      (COOLDOWN_AFTER_CLOSE_MS - sinceCloseMs) / 1000,
+    );
+    const label =
+      remainingSec >= 60
+        ? `${Math.ceil(remainingSec / 60)}min`
+        : `${remainingSec}s`;
+    return `cooldown_${label}_after_${lastClosed.exitReason ?? "close"}`;
   }
 
-  // ── 13. Main cycle ──────────────────────────────────────────────
+  // ── 15. Main cycle ──────────────────────────────────────────────
   let cycleCount = 0;
   let isRunning = false;
 
@@ -431,74 +308,69 @@ async function bootstrap() {
     try {
       resetDailyStatsIfNewDay();
 
-      // 1. Подкачать свежие свечи (для всех символов сразу)
+      // 1. Подкачать свечи (для всех символов сразу)
       if (marketDataPoller) {
         await marketDataPoller.sync();
       }
 
-      // 2. Построить ДВА контекста: для BTC и для ETH параллельно.
-      //    ETH-контекст собирается с skipML=true, т.к. модель на ETH
-      //    не обучена, а Breakout стратегия ML не использует.
-      const [ctxML, ctxBreakout] = await Promise.all([
-        contextBuilder.build({ symbol: MLONLY_SYMBOL }),
-        contextBuilder.build({ symbol: BREAKOUT_SYMBOL, skipML: true }),
-      ]);
-
-      if (!ctxML || !ctxBreakout) {
-        console.warn("⚠️  Failed to build one of contexts, skipping cycle");
+      // 2. Daily loss check (global)
+      if (isStoppedByDailyLoss()) {
+        console.log(
+          `⏹️  Daily loss limit hit ($${dailyStats.pnL.toFixed(2)} <= -$${DAILY_LOSS_LIMIT}), skip cycle`,
+        );
         return;
       }
 
-      // 3. Компактный лог контекстных условий
-      const logCtxSummary = (tag, ctx) => {
-        const fr = ctx.marketContext?.funding;
-        const tc = ctx.marketContext?.time;
-        const parts = [`price ${ctx.price?.toFixed(2)}`];
-        if (fr) parts.push(`funding ${fr.ratePct.toFixed(3)}%`);
-        if (tc?.isRiskyHour) parts.push(`⚠️risky(${tc.reason})`);
-        console.log(`🌐 [${tag}] ${parts.join(" | ")}`);
-      };
-      logCtxSummary(MLONLY_SYMBOL, ctxML);
-      logCtxSummary(BREAKOUT_SYMBOL, ctxBreakout);
+      // 3. Обработать каждый символ по очереди
+      for (const symbol of SYMBOLS) {
+        // 3a. Cooldown check (per-symbol)
+        const cooldownReason = await isInCooldown(symbol);
+        if (cooldownReason) {
+          console.log(`\n⏸️  [${symbol}] skip: ${cooldownReason}`);
+          continue;
+        }
 
-      // 4. Прогнать Breakout (на ETH, без ML)
-      console.log(`\n🔹 Breakout 1h [${BREAKOUT_SYMBOL}]:`);
-      const breakoutResult = await runStrategy({
-        strategy: breakoutStrategy,
-        store: breakoutStore,
-        execution: breakoutExecution,
-        ctx: ctxBreakout,
-        clientOrderPrefix: "BRK",
-        fixedSize: null,
-      });
-      console.log(`   ${JSON.stringify(breakoutResult)}`);
+        // 3b. Open position check (per-symbol)
+        const open =
+          typeof confluenceStore.getOpenPositionBySymbol === "function"
+            ? await confluenceStore.getOpenPositionBySymbol(symbol)
+            : null;
+        if (open) {
+          console.log(
+            `\n📌 [${symbol}] position already open (${open.side} @ ${open.entry}), skip`,
+          );
+          continue;
+        }
 
-      // 5. Прогнать ML-Only (на BTC)
-      console.log(`\n🔸 ML-Only [${MLONLY_SYMBOL}]:`);
-      const mlResult = await runStrategy({
-        strategy: mlOnlyStrategy,
-        store: mlOnlyStore,
-        execution: mlOnlyExecution,
-        ctx: ctxML,
-        clientOrderPrefix: "ML",
-        fixedSize: ML_ONLY_SIZE_BTC,
-      });
-      console.log(`   ${JSON.stringify(mlResult)}`);
+        // 3c. Run trading engine
+        console.log(`\n🔹 [${symbol}] running engine...`);
+        const result = await tradingEngine.run({ symbol });
+        console.log(
+          `   → ${result.status}${result.reason ? ": " + result.reason : ""}`,
+        );
+      }
 
-      // 6. Статистика
-      const breakoutStats = await breakoutStore.getStats();
-      const mlStats = await mlOnlyStore.getStats();
+      // 4. Stats (общая + per-symbol breakdown)
+      if (typeof confluenceStore.getStats === "function") {
+        const stats = await confluenceStore.getStats();
+        console.log(
+          `\n📊 Total: ${stats.totalTrades} trades | WR ${stats.winRate.toFixed(0)}% | PF ${stats.profitFactor.toFixed(2)} | PnL $${stats.totalPnL.toFixed(2)} | Open: ${stats.openPositions}`,
+        );
+        console.log(`   Today PnL: $${dailyStats.pnL.toFixed(2)}`);
 
-      console.log(`\n📊 Stats:`);
-      console.log(
-        `   Breakout: ${breakoutStats.totalTrades} trades | WR ${breakoutStats.winRate.toFixed(0)}% | PF ${breakoutStats.profitFactor.toFixed(2)} | PnL $${breakoutStats.totalPnL.toFixed(2)} | Open: ${breakoutStats.openPositions}`,
-      );
-      console.log(
-        `   ML-Only:  ${mlStats.totalTrades} trades | WR ${mlStats.winRate.toFixed(0)}% | PF ${mlStats.profitFactor.toFixed(2)} | PnL $${mlStats.totalPnL.toFixed(2)} | Open: ${mlStats.openPositions}`,
-      );
-      console.log(
-        `   Today:    Breakout $${dailyStats.breakoutPnL.toFixed(2)} | ML-Only $${dailyStats.mlOnlyPnL.toFixed(2)}`,
-      );
+        if (typeof confluenceStore.getStatsBySymbol === "function") {
+          const bySymbol = await confluenceStore.getStatsBySymbol();
+          if (bySymbol.length > 0) {
+            console.log(`   By symbol:`);
+            for (const s of bySymbol) {
+              const sign = s.totalPnL >= 0 ? "+" : "";
+              console.log(
+                `     ${s.symbol}: ${s.trades} trades | WR ${s.winRate.toFixed(0)}% | PF ${s.profitFactor.toFixed(2)} | PnL ${sign}$${s.totalPnL.toFixed(2)}`,
+              );
+            }
+          }
+        }
+      }
     } catch (err) {
       console.error(`\n❌ Cycle error: ${err.message}`);
       console.error(err.stack);
@@ -511,19 +383,7 @@ async function bootstrap() {
     }
   };
 
-  // ── 13.5. [GAP #2] Startup reconcile ────────────────────────────
-  //
-  // КРИТИЧНО: сверка БД↔биржа ДО первого runCycle.
-  //
-  // Если бот упал между placeMarketOrder и store.close() на прошлом запуске:
-  //   - На бирже: позиция уже закрыта
-  //   - В БД:    позиция всё ещё OPEN
-  // Без reconcile runCycle увидит "already_has_open_position" и не откроет
-  // новую, а PositionMonitor будет циклически пытаться её закрывать
-  // (reduceOnly reject).
-  //
-  // Обратный кейс (позиция на бирже есть, в БД нет) — Telegram-алерт,
-  // НЕ закрываем автоматически, т.к. не знаем SL/TP/entry.
+  // ── 16. Startup reconcile ───────────────────────────────────────
   if (MODE === "live" || MODE === "testnet") {
     try {
       await positionMonitor.reconcileOnStartup();
@@ -535,14 +395,14 @@ async function bootstrap() {
     }
   }
 
-  // ── 13.6. First cycle + start monitor + interval ────────────────
+  // ── 17. First cycle + start monitor + interval ──────────────────
   await runCycle();
   if (MODE === "live" || MODE === "testnet") {
     positionMonitor.start();
   }
   const interval = setInterval(runCycle, CYCLE_INTERVAL_MS);
 
-  // ── 14. Graceful shutdown ───────────────────────────────────────
+  // ── 18. Graceful shutdown ───────────────────────────────────────
   const shutdown = async (signal) => {
     console.log(`\n\n🛑 ${signal} received, shutting down...`);
     clearInterval(interval);
@@ -554,22 +414,15 @@ async function bootstrap() {
     }
 
     if (MODE === "live" || MODE === "testnet") {
-      const breakoutOpen = await breakoutStore.getOpenPositions();
-      const mlOpen = await mlOnlyStore.getOpenPositions();
-
-      if (breakoutOpen.length > 0 || mlOpen.length > 0) {
+      const open = await confluenceStore.getOpenPositions();
+      if (open.length > 0) {
         console.log(`\n⚠️  Open positions remain on exchange:`);
-        for (const p of breakoutOpen) {
+        for (const p of open) {
           console.log(
-            `   Breakout: ${p.side} ${p.symbol} @ ${p.entry} (SL ${p.stopLoss})`,
+            `   ${p.symbol} ${p.side} @ ${p.entry} (SL ${p.stopLoss}, TP ${p.takeProfit})`,
           );
         }
-        for (const p of mlOpen) {
-          console.log(
-            `   ML-Only:  ${p.side} ${p.symbol} @ ${p.entry} (SL ${p.stopLoss})`,
-          );
-        }
-        console.log(`   They will be managed by SL/TP orders on Binance.`);
+        console.log(`   They will continue to be monitored on next start.`);
       }
     }
 
@@ -577,16 +430,13 @@ async function bootstrap() {
     console.log("FINAL STATS");
     console.log("═".repeat(70));
 
-    const breakoutStats = await breakoutStore.getStats();
-    const mlStats = await mlOnlyStore.getStats();
-
-    console.log(`   Total cycles: ${cycleCount}`);
-    console.log(
-      `   Breakout (${BREAKOUT_SYMBOL}): ${breakoutStats.totalTrades} trades, WR ${breakoutStats.winRate.toFixed(0)}%, PnL $${breakoutStats.totalPnL.toFixed(2)}`,
-    );
-    console.log(
-      `   ML-Only (${MLONLY_SYMBOL}):     ${mlStats.totalTrades} trades, WR ${mlStats.winRate.toFixed(0)}%, PnL $${mlStats.totalPnL.toFixed(2)}`,
-    );
+    if (typeof confluenceStore.getStats === "function") {
+      const stats = await confluenceStore.getStats();
+      console.log(`   Total cycles: ${cycleCount}`);
+      console.log(
+        `   Confluence: ${stats.totalTrades} trades, WR ${stats.winRate.toFixed(0)}%, PnL $${stats.totalPnL.toFixed(2)}`,
+      );
+    }
     console.log("═".repeat(70));
     positionMonitor.stop();
     await disconnectMongo();
